@@ -6,6 +6,8 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
 }
 
 impl Track {
@@ -20,6 +22,12 @@ impl Track {
             title: title.into(),
             artist: artist.into(),
             duration_ms,
+            thumbnail_url: None,
         }
+    }
+
+    pub fn with_thumbnail(mut self, thumbnail_url: impl Into<String>) -> Self {
+        self.thumbnail_url = Some(thumbnail_url.into());
+        self
     }
 }
