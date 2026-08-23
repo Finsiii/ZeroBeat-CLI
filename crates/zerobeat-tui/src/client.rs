@@ -41,7 +41,7 @@ impl DaemonClient {
         self.connection.send(&command).await?;
         match self.connection.receive().await? {
             DaemonEvent::Snapshot(snapshot) => {
-                self.snapshot = snapshot;
+                self.snapshot = *snapshot;
                 Ok(self.snapshot.clone())
             }
             DaemonEvent::Rejected(reason) => Err(ClientError::Rejected(reason)),

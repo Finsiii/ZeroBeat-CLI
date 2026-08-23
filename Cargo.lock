@@ -2245,6 +2245,9 @@ dependencies = [
 name = "zerobeat-audio"
 version = "0.1.0"
 dependencies = [
+ "cc",
+ "pkg-config",
+ "tempfile",
  "thiserror",
  "zerobeat-core",
 ]
@@ -2272,6 +2275,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "zerobeat-api",
+ "zerobeat-audio",
  "zerobeat-catalog",
  "zerobeat-core",
  "zerobeat-ipc",

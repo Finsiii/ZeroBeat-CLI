@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -73,4 +75,6 @@ pub(crate) struct ResolveResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResolveFormat {
     pub audio_url: Option<String>,
+    #[serde(default)]
+    pub http_headers: BTreeMap<String, String>,
 }

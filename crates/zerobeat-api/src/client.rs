@@ -112,7 +112,9 @@ impl ApiClient {
             .audio_url
             .filter(|url| !url.trim().is_empty())
             .ok_or(ApiError::InvalidResponse("missing audio URL"))?;
-        Ok(ResolvedStream::new(url))
+        let mut stream = ResolvedStream::new(url);
+        stream.headers = response.format.http_headers.into_iter().collect();
+        Ok(stream)
     }
 
     async fn send_signed_get(&self, path: &str, raw_query: &str) -> Result<Vec<u8>, ApiError> {

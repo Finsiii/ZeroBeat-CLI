@@ -1,10 +1,12 @@
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
-use zerobeat_catalog::{
-    AudioQuality, CatalogError, CatalogFuture, MusicCatalog, ResolvedStream, SearchRequest,
-};
+
+use zerobeat_audio::{AudioBackend, BackendError, StreamSource};
+use zerobeat_catalog::{AudioQuality, CatalogFuture, MusicCatalog, ResolvedStream, SearchRequest};
 use zerobeat_core::{Route, SessionMode, Track};
 use zerobeat_daemon::{DaemonError, DaemonServer};
 use zerobeat_ipc::IpcConnection;
+use zerobeat_protocol::PlaybackStatus;
 use zerobeat_protocol::{AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION, SearchStatus};
 
 #[tokio::test]
@@ -62,9 +64,14 @@ async fn second_daemon_cannot_replace_a_live_socket() {
 async fn search_runs_in_background_and_updates_the_snapshot() {
     let directory = tempdir().unwrap();
     let socket = directory.path().join("zerobeat.sock");
-    let server = DaemonServer::bind_with_catalog(&socket, TestCatalog)
-        .await
-        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let server = DaemonServer::bind_with_services(
+        &socket,
+        TestCatalog,
+        RecordingBackend(Arc::clone(&events)),
+    )
+    .await
+    .unwrap();
     let server_task = tokio::spawn(server.run());
     let mut client = IpcConnection::connect(&socket).await.unwrap();
 
@@ -87,6 +94,28 @@ async fn search_runs_in_background_and_updates_the_snapshot() {
     };
     assert_eq!(ready.search.results[0].title, "Tampar");
 
+    let resolving = exchange(&mut client, ClientCommand::PlaySelected).await;
+    let DaemonEvent::Snapshot(resolving) = resolving else {
+        panic!("expected playback snapshot");
+    };
+    assert_eq!(resolving.playback.status, PlaybackStatus::Resolving);
+
+    let playing = loop {
+        let event = exchange(&mut client, ClientCommand::RequestSnapshot).await;
+        let DaemonEvent::Snapshot(snapshot) = event else {
+            panic!("expected snapshot");
+        };
+        if snapshot.playback.status == PlaybackStatus::Playing {
+            break snapshot;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(playing.playback.current.unwrap().title, "Tampar");
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["stop", "load:https://stream.example/tampar", "play"]
+    );
+
     exchange(&mut client, ClientCommand::Shutdown).await;
     server_task.await.unwrap().unwrap();
 }
@@ -102,14 +131,14 @@ fn assert_snapshot(
     expected_route: Route,
     expected_query: &str,
 ) {
-    let DaemonEvent::Snapshot(AppSnapshot {
+    let DaemonEvent::Snapshot(snapshot) = event else {
+        panic!("expected snapshot, got {event:?}");
+    };
+    let AppSnapshot {
         session,
         navigation,
         ..
-    }) = event
-    else {
-        panic!("expected snapshot, got {event:?}");
-    };
+    } = snapshot.as_ref();
 
     assert_eq!(*session, expected_session);
     assert_eq!(navigation.active_route(), expected_route);
@@ -136,6 +165,33 @@ impl MusicCatalog for TestCatalog {
         _track_id: &str,
         _quality: AudioQuality,
     ) -> CatalogFuture<'_, ResolvedStream> {
-        Box::pin(async { Err(CatalogError::Unavailable("not used".into())) })
+        Box::pin(async { Ok(ResolvedStream::new("https://stream.example/tampar")) })
+    }
+}
+
+struct RecordingBackend(Arc<Mutex<Vec<&'static str>>>);
+
+impl AudioBackend for RecordingBackend {
+    fn load(&mut self, _source: &StreamSource) -> Result<(), BackendError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push("load:https://stream.example/tampar");
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), BackendError> {
+        self.0.lock().unwrap().push("play");
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        self.0.lock().unwrap().push("pause");
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), BackendError> {
+        self.0.lock().unwrap().push("stop");
+        Ok(())
     }
 }

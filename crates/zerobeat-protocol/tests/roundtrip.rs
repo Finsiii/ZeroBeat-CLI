@@ -1,7 +1,7 @@
 use zerobeat_core::{NavigationState, Route, SessionMode, Track};
 use zerobeat_protocol::{
-    AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION, SearchSnapshot, SearchStatus,
-    decode, encode,
+    AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION, PlaybackSnapshot, PlaybackStatus,
+    SearchSnapshot, SearchStatus, decode, encode,
 };
 
 #[test]
@@ -14,6 +14,9 @@ fn command_round_trips_without_losing_payload() {
         ClientCommand::UpdateSearch("tampar".into()),
         ClientCommand::SubmitSearch,
         ClientCommand::SelectNext,
+        ClientCommand::PlaySelected,
+        ClientCommand::TogglePlayback,
+        ClientCommand::NextTrack,
         ClientCommand::RequestSnapshot,
         ClientCommand::Shutdown,
     ];
@@ -30,7 +33,7 @@ fn snapshot_event_round_trips_with_guest_navigation_state() {
     let mut navigation = NavigationState::default();
     navigation.open(Route::Search);
     navigation.update_search("juicy luicy");
-    let event = DaemonEvent::Snapshot(AppSnapshot {
+    let event = DaemonEvent::Snapshot(Box::new(AppSnapshot {
         session: SessionMode::Guest,
         navigation,
         search: SearchSnapshot {
@@ -39,7 +42,17 @@ fn snapshot_event_round_trips_with_guest_navigation_state() {
             selected_index: 0,
             request_id: 1,
         },
-    });
+        playback: PlaybackSnapshot {
+            status: PlaybackStatus::Playing,
+            current: Some(Track::new("video-1", "Tampar", "Juicy Luicy", 245_000)),
+            position_ms: 12_000,
+            duration_ms: 245_000,
+            buffered_ms: 30_000,
+            volume_percent: 80,
+            error: None,
+            request_id: 1,
+        },
+    }));
 
     let bytes = encode(&event).expect("encode event");
     let decoded: DaemonEvent = decode(&bytes).expect("decode event");

@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         render_compact(frame, rows[0], app);
     }
-    render_player(frame, rows[1]);
+    render_player(frame, rows[1], app);
 }
 
 fn render_wide(frame: &mut Frame, area: Rect, app: &App) {

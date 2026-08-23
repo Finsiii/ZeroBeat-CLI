@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use zerobeat_core::Route;
-use zerobeat_protocol::{AppSnapshot, ClientCommand, SearchSnapshot};
+use zerobeat_protocol::{
+    AppSnapshot, ClientCommand, PlaybackSnapshot, PlaybackStatus, SearchSnapshot, SearchStatus,
+};
 
 #[derive(Default)]
 pub struct App {
@@ -37,6 +39,18 @@ impl App {
         &self.snapshot.search
     }
 
+    pub fn playback(&self) -> &PlaybackSnapshot {
+        &self.snapshot.playback
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        self.search().status == SearchStatus::Loading
+            || matches!(
+                self.playback().status,
+                PlaybackStatus::Resolving | PlaybackStatus::Buffering | PlaybackStatus::Playing
+            )
+    }
+
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -69,6 +83,21 @@ impl App {
                 self.snapshot.navigation.back();
                 Some(ClientCommand::Back)
             }
+            KeyCode::Enter
+                if self.route() == Route::Search && !self.search().results.is_empty() =>
+            {
+                Some(ClientCommand::PlaySelected)
+            }
+            KeyCode::Char(' ') => Some(ClientCommand::TogglePlayback),
+            KeyCode::Char('n') => Some(ClientCommand::NextTrack),
+            KeyCode::Left => Some(ClientCommand::SeekRelative(-10_000)),
+            KeyCode::Right => Some(ClientCommand::SeekRelative(10_000)),
+            KeyCode::Char('-') => Some(ClientCommand::SetVolume(
+                self.playback().volume_percent.saturating_sub(5),
+            )),
+            KeyCode::Char('+') | KeyCode::Char('=') => Some(ClientCommand::SetVolume(
+                self.playback().volume_percent.saturating_add(5).min(100),
+            )),
             KeyCode::Down | KeyCode::Char('j') => Some(ClientCommand::SelectNext),
             KeyCode::Up | KeyCode::Char('k') => Some(ClientCommand::SelectPrevious),
             _ => None,

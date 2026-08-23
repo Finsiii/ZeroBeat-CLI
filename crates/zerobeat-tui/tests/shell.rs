@@ -1,7 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use zerobeat_core::{Route, Track};
-use zerobeat_protocol::{AppSnapshot, ClientCommand, SearchSnapshot, SearchStatus};
+use zerobeat_protocol::{
+    AppSnapshot, ClientCommand, PlaybackSnapshot, PlaybackStatus, SearchSnapshot, SearchStatus,
+};
 use zerobeat_tui::{App, render};
 
 #[test]
@@ -86,12 +88,40 @@ fn enter_submits_search_and_results_can_be_selected() {
     app.replace_snapshot(snapshot);
 
     assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(ClientCommand::PlaySelected)
+    );
+    assert_eq!(
         app.handle_key(key(KeyCode::Down)),
         Some(ClientCommand::SelectNext)
     );
     let screen = render_screen(100, 30, &app);
     assert!(screen.contains("Tampar"));
     assert!(screen.contains("Juicy Luicy"));
+}
+
+#[test]
+fn player_bar_shows_current_track_and_transport_state() {
+    let snapshot = AppSnapshot {
+        playback: PlaybackSnapshot {
+            status: PlaybackStatus::Playing,
+            current: Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000)),
+            position_ms: 61_000,
+            duration_ms: 203_000,
+            buffered_ms: 90_000,
+            volume_percent: 75,
+            error: None,
+            request_id: 1,
+        },
+        ..AppSnapshot::default()
+    };
+
+    let screen = render_screen(100, 28, &App::new(snapshot));
+
+    assert!(screen.contains("Tampar"));
+    assert!(screen.contains("Juicy Luicy"));
+    assert!(screen.contains("01:01 / 03:23"));
+    assert!(screen.contains("75%"));
 }
 
 fn render_screen(width: u16, height: u16, app: &App) -> String {

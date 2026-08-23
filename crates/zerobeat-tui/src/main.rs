@@ -9,7 +9,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use zerobeat_protocol::{ClientCommand, SearchStatus};
+use zerobeat_protocol::ClientCommand;
 use zerobeat_runtime::socket_path;
 use zerobeat_tui::{App, connect_or_spawn, render};
 
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while !app.should_quit() {
         terminal.draw(&app)?;
         if !event::poll(Duration::from_millis(100))? {
-            if app.search().status == SearchStatus::Loading {
+            if app.needs_refresh() {
                 let snapshot = client.execute(ClientCommand::RequestSnapshot).await?;
                 app.replace_snapshot(snapshot);
             }

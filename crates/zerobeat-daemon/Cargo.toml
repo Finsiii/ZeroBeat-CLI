@@ -10,6 +10,7 @@ rust-version.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zerobeat-api = { path = "../zerobeat-api" }
+zerobeat-audio = { path = "../zerobeat-audio" }
 zerobeat-core = { path = "../zerobeat-core" }
 zerobeat-catalog = { path = "../zerobeat-catalog" }
 zerobeat-ipc = { path = "../zerobeat-ipc" }

@@ -6,7 +6,7 @@ use tokio::{
     net::TcpListener,
 };
 use zerobeat_api::{ApiCatalog, ApiConfig};
-use zerobeat_catalog::{MusicCatalog, SearchRequest};
+use zerobeat_catalog::{AudioQuality, MusicCatalog, SearchRequest};
 
 #[tokio::test]
 async fn provisions_without_static_secret_then_sends_signed_search() {
@@ -27,6 +27,10 @@ async fn provisions_without_static_secret_then_sends_signed_search() {
         .search_songs(SearchRequest::new("tampar", 20).unwrap())
         .await
         .unwrap();
+    let stream = client
+        .resolve_stream("video-123", AudioQuality::Automatic)
+        .await
+        .unwrap();
     server.await.unwrap();
 
     assert_eq!(tracks.len(), 1);
@@ -35,13 +39,20 @@ async fn provisions_without_static_secret_then_sends_signed_search() {
     assert_eq!(tracks[0].artist, "Juicy Luicy");
 
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(stream.headers.len(), 2);
+    assert!(
+        stream
+            .headers
+            .contains(&("User-Agent".into(), "ZeroBeat Test".into()))
+    );
+    assert_eq!(requests.len(), 4);
     assert!(requests[0].starts_with("POST /music/v1/device/challenge "));
     assert!(requests[1].starts_with("POST /music/v1/device/provision "));
     assert!(!requests[1].contains("desktopProvisionSecret"));
     assert!(requests[2].starts_with("GET /music/v1/app/search/songs?q=tampar&limit=20 "));
     assert!(requests[2].contains("x-zerobeat-signature-version: v5"));
     assert!(requests[2].contains("x-zerobeat-device-id: device-123"));
+    assert!(requests[3].starts_with("GET /music/v1/app/stream/resolve?video_id=video-123 "));
 }
 
 async fn mock_server(requests: Arc<Mutex<Vec<String>>>) -> (String, tokio::task::JoinHandle<()>) {
@@ -52,6 +63,7 @@ async fn mock_server(requests: Arc<Mutex<Vec<String>>>) -> (String, tokio::task:
             r#"{"challenge":"c2luZ2xlLXVzZS1jaGFsbGVuZ2U","integrityNonce":"nonce","expiresAt":"2026-08-24T02:00:00Z"}"#,
             r#"{"deviceId":"device-123","keyVersion":1,"signatureVersion":"v5","assuranceTier":"LOW"}"#,
             r#"{"items":[{"videoId":"video-123","title":"Tampar","artists":[{"name":"Juicy Luicy"}],"durationSeconds":245,"thumbnails":[{"url":"https://img.example/cover.jpg","width":544,"height":544}]}],"continuation":null,"source":"backend-app-compatible"}"#,
+            r#"{"format":{"audioUrl":"https://stream.example/audio.webm","httpHeaders":{"User-Agent":"ZeroBeat Test","Referer":"https://music.youtube.com/"}}}"#,
         ];
         for response in responses {
             let (mut stream, _) = listener.accept().await.unwrap();

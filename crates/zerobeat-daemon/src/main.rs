@@ -1,6 +1,7 @@
 use std::{error::Error, ffi::OsString, path::PathBuf};
 
 use zerobeat_api::{ApiCatalog, ApiConfig};
+use zerobeat_audio::NativeEngine;
 use zerobeat_daemon::DaemonServer;
 use zerobeat_runtime::{current_data_dir, prepare_data_dir, prepare_runtime_dir, socket_path};
 
@@ -20,7 +21,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         data_directory.join("device.identity"),
         format!("cli/{}+1", env!("CARGO_PKG_VERSION")),
     )?;
-    DaemonServer::bind_with_catalog(socket, ApiCatalog::new(config))
+    DaemonServer::bind_with_services(socket, ApiCatalog::new(config), NativeEngine::new()?)
         .await?
         .run()
         .await?;
