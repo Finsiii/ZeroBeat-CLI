@@ -9,6 +9,8 @@ repository = "https://github.com/Finsiii/ZeroBeat-CLI"
 rust-version = "1.88"
 
 [workspace.dependencies]
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
