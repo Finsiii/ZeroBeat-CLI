@@ -999,6 +999,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerobeat-audio"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "zerobeat-core",
+]
+
+[[package]]
+name = "zerobeat-catalog"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "zerobeat-core",
+]
+
+[[package]]
 name = "zerobeat-core"
 version = "0.1.0"
 dependencies = [
