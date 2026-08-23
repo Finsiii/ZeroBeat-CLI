@@ -13,6 +13,7 @@ pub struct AppSnapshot {
 pub enum ClientCommand {
     Hello { protocol_version: u16 },
     Navigate(Route),
+    Back,
     UpdateSearch(String),
     RequestSnapshot,
     Shutdown,

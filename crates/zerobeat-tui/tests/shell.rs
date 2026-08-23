@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use zerobeat_core::Route;
+use zerobeat_protocol::ClientCommand;
 use zerobeat_tui::{App, render};
 
 #[test]
@@ -38,6 +39,23 @@ fn slash_focuses_search_and_query_survives_navigation() {
     assert_eq!(app.route(), Route::Search);
     assert_eq!(app.search_query(), "tampar");
     assert!(!app.search_focused());
+}
+
+#[test]
+fn navigation_and_search_keys_produce_daemon_commands() {
+    let mut app = App::default();
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('2'))),
+        Some(ClientCommand::Navigate(Route::Search))
+    );
+    app.handle_key(key(KeyCode::Char('/')));
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('a'))),
+        Some(ClientCommand::UpdateSearch("a".to_owned()))
+    );
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), Some(ClientCommand::Back));
 }
 
 fn render_screen(width: u16, height: u16, app: &App) -> String {

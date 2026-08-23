@@ -33,6 +33,9 @@ async fn state_survives_client_disconnect_and_reconnect() {
     let restored = exchange(&mut second, ClientCommand::RequestSnapshot).await;
     assert_snapshot(&restored, SessionMode::Guest, Route::Search, "tampar");
 
+    let restored = exchange(&mut second, ClientCommand::Back).await;
+    assert_snapshot(&restored, SessionMode::Guest, Route::Home, "tampar");
+
     let stopped = exchange(&mut second, ClientCommand::Shutdown).await;
     assert_eq!(stopped, DaemonEvent::Acknowledged);
     server_task

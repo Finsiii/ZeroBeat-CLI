@@ -1015,6 +1015,7 @@ dependencies = [
  "zerobeat-core",
  "zerobeat-ipc",
  "zerobeat-protocol",
+ "zerobeat-runtime",
 ]
 
 [[package]]
@@ -1038,6 +1039,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerobeat-runtime"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "zerobeat-storage"
 version = "0.1.0"
 dependencies = [
@@ -1053,6 +1063,12 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "tempfile",
+ "thiserror",
+ "tokio",
  "zerobeat-core",
+ "zerobeat-daemon",
+ "zerobeat-ipc",
  "zerobeat-protocol",
+ "zerobeat-runtime",
 ]

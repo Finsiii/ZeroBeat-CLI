@@ -107,6 +107,11 @@ async fn apply_command(command: ClientCommand, state: &Mutex<AppSnapshot>) -> (D
             snapshot.navigation.open(route);
             (DaemonEvent::Snapshot(snapshot.clone()), false)
         }
+        ClientCommand::Back => {
+            let mut snapshot = state.lock().await;
+            snapshot.navigation.back();
+            (DaemonEvent::Snapshot(snapshot.clone()), false)
+        }
         ClientCommand::UpdateSearch(query) => {
             let mut snapshot = state.lock().await;
             snapshot.navigation.update_search(query);

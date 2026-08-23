@@ -9,10 +9,17 @@ rust-version.workspace = true
 [dependencies]
 crossterm.workspace = true
 ratatui.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 zerobeat-core = { path = "../zerobeat-core" }
+zerobeat-ipc = { path = "../zerobeat-ipc" }
 zerobeat-protocol = { path = "../zerobeat-protocol" }
+zerobeat-runtime = { path = "../zerobeat-runtime" }
+
+[dev-dependencies]
+tempfile = "3"
+zerobeat-daemon = { path = "../zerobeat-daemon" }
 
 [[bin]]
 name = "zerobeat"
 path = "src/main.rs"
-
