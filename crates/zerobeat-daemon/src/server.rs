@@ -22,7 +22,7 @@ pub struct DaemonServer {
 impl DaemonServer {
     pub async fn bind(path: impl AsRef<Path>) -> Result<Self, DaemonError> {
         let socket_path = path.as_ref().to_path_buf();
-        remove_stale_socket(&socket_path)?;
+        remove_stale_socket(&socket_path).await?;
         let listener = UnixListener::bind(&socket_path)?;
 
         Ok(Self {
@@ -121,7 +121,7 @@ async fn apply_command(command: ClientCommand, state: &Mutex<AppSnapshot>) -> (D
     }
 }
 
-fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
+async fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -130,6 +130,16 @@ fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
 
     if !metadata.file_type().is_socket() {
         return Err(DaemonError::SocketPathOccupied(path.to_path_buf()));
+    }
+
+    match UnixStream::connect(path).await {
+        Ok(_) => return Err(DaemonError::AlreadyRunning(path.to_path_buf())),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(error) => return Err(error.into()),
     }
 
     std::fs::remove_file(path)?;

@@ -10,4 +10,6 @@ pub enum DaemonError {
     Ipc(#[from] zerobeat_ipc::IpcError),
     #[error("socket path is occupied by a non-socket file: {0}")]
     SocketPathOccupied(PathBuf),
+    #[error("another daemon is already listening on: {0}")]
+    AlreadyRunning(PathBuf),
 }

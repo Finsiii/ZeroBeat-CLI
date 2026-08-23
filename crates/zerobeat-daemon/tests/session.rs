@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 use zerobeat_core::{Route, SessionMode};
-use zerobeat_daemon::DaemonServer;
+use zerobeat_daemon::{DaemonError, DaemonServer};
 use zerobeat_ipc::IpcConnection;
 use zerobeat_protocol::{AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION};
 
@@ -42,6 +42,17 @@ async fn state_survives_client_disconnect_and_reconnect() {
         .await
         .expect("server task")
         .expect("server shutdown");
+}
+
+#[tokio::test]
+async fn second_daemon_cannot_replace_a_live_socket() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let _first = DaemonServer::bind(&socket).await.unwrap();
+
+    let second = DaemonServer::bind(&socket).await;
+
+    assert!(matches!(second, Err(DaemonError::AlreadyRunning(path)) if path == socket));
 }
 
 async fn exchange(connection: &mut IpcConnection, command: ClientCommand) -> DaemonEvent {
