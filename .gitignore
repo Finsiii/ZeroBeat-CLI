@@ -3,4 +3,8 @@
 *.db-shm
 *.db-wal
 .env
-
+/.local-test/
+/test-artifacts/
+/test-media/private/
+*.identity
+*.identity.*

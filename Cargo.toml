@@ -9,12 +9,17 @@ repository = "https://github.com/Finsiii/ZeroBeat-CLI"
 rust-version = "1.88"
 
 [workspace.dependencies]
+base64 = "0.22"
 crossterm = "0.29"
+hex = "0.4"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rmp-serde = "1"
 rusqlite = "0.37"
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
