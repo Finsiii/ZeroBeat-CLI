@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use zerobeat_core::Route;
-use zerobeat_protocol::{AppSnapshot, ClientCommand};
+use zerobeat_protocol::{AppSnapshot, ClientCommand, SearchSnapshot};
 
 #[derive(Default)]
 pub struct App {
@@ -31,6 +31,10 @@ impl App {
 
     pub fn search_focused(&self) -> bool {
         self.search_focused
+    }
+
+    pub fn search(&self) -> &SearchSnapshot {
+        &self.snapshot.search
     }
 
     pub fn should_quit(&self) -> bool {
@@ -65,6 +69,8 @@ impl App {
                 self.snapshot.navigation.back();
                 Some(ClientCommand::Back)
             }
+            KeyCode::Down | KeyCode::Char('j') => Some(ClientCommand::SelectNext),
+            KeyCode::Up | KeyCode::Char('k') => Some(ClientCommand::SelectPrevious),
             _ => None,
         }
     }
@@ -76,9 +82,13 @@ impl App {
 
     fn handle_search_key(&mut self, code: KeyCode) -> Option<ClientCommand> {
         match code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
                 self.search_focused = false;
                 None
+            }
+            KeyCode::Enter => {
+                self.search_focused = false;
+                (!self.search_query().trim().is_empty()).then_some(ClientCommand::SubmitSearch)
             }
             KeyCode::Backspace => {
                 let mut query = self.search_query().to_owned();

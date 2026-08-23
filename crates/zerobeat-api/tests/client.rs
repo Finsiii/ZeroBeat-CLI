@@ -5,7 +5,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use zerobeat_api::{ApiClient, ApiConfig};
+use zerobeat_api::{ApiCatalog, ApiConfig};
 use zerobeat_catalog::{MusicCatalog, SearchRequest};
 
 #[tokio::test]
@@ -21,7 +21,8 @@ async fn provisions_without_static_secret_then_sends_signed_search() {
     )
     .unwrap();
 
-    let client = ApiClient::connect(config).await.unwrap();
+    let client = ApiCatalog::new(config);
+    assert!(requests.lock().unwrap().is_empty());
     let tracks = client
         .search_songs(SearchRequest::new("tampar", 20).unwrap())
         .await

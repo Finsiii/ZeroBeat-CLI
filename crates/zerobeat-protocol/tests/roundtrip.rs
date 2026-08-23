@@ -1,6 +1,7 @@
-use zerobeat_core::{NavigationState, Route, SessionMode};
+use zerobeat_core::{NavigationState, Route, SessionMode, Track};
 use zerobeat_protocol::{
-    AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION, decode, encode,
+    AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION, SearchSnapshot, SearchStatus,
+    decode, encode,
 };
 
 #[test]
@@ -11,6 +12,8 @@ fn command_round_trips_without_losing_payload() {
         },
         ClientCommand::Navigate(Route::Library),
         ClientCommand::UpdateSearch("tampar".into()),
+        ClientCommand::SubmitSearch,
+        ClientCommand::SelectNext,
         ClientCommand::RequestSnapshot,
         ClientCommand::Shutdown,
     ];
@@ -30,6 +33,12 @@ fn snapshot_event_round_trips_with_guest_navigation_state() {
     let event = DaemonEvent::Snapshot(AppSnapshot {
         session: SessionMode::Guest,
         navigation,
+        search: SearchSnapshot {
+            status: SearchStatus::Ready,
+            results: vec![Track::new("video-1", "Tampar", "Juicy Luicy", 245_000)],
+            selected_index: 0,
+            request_id: 1,
+        },
     });
 
     let bytes = encode(&event).expect("encode event");

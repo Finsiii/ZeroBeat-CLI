@@ -252,7 +252,7 @@ fn rejection_message(body: &[u8], status: StatusCode) -> String {
         })
 }
 
-fn catalog_error(error: ApiError) -> CatalogError {
+pub(crate) fn catalog_error(error: ApiError) -> CatalogError {
     match error {
         ApiError::Rejected {
             status: 401 | 403, ..

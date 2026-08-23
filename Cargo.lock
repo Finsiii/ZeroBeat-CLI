@@ -2271,6 +2271,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "zerobeat-api",
+ "zerobeat-catalog",
  "zerobeat-core",
  "zerobeat-ipc",
  "zerobeat-protocol",

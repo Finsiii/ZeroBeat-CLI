@@ -6,4 +6,6 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("runtime path is not a private directory: {0}")]
     UnsafeDirectory(PathBuf),
+    #[error("cannot locate the user data directory")]
+    MissingHomeDirectory,
 }

@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use zerobeat_core::Route;
+use zerobeat_protocol::SearchStatus;
 
 use crate::{App, theme};
 
@@ -72,6 +73,9 @@ fn render_home(frame: &mut Frame, area: Rect) {
 }
 
 fn render_search(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(5)])
+        .spacing(1)
+        .split(area.inner(ratatui::layout::Margin::new(2, 1)));
     let query = if app.search_query().is_empty() {
         "Type to search songs, artists, albums, and playlists"
     } else {
@@ -92,7 +96,67 @@ fn render_search(frame: &mut Frame, area: Rect, app: &App) {
             .border_style(Style::default().fg(border)),
     )
     .style(Style::default().bg(theme::SURFACE));
-    frame.render_widget(search, area.inner(ratatui::layout::Margin::new(2, 2)));
+    frame.render_widget(search, rows[0]);
+
+    let mut lines = Vec::new();
+    match &app.search().status {
+        SearchStatus::Idle => {
+            lines.push(Line::styled(
+                "Search by song, artist, album, or playlist",
+                Style::default().fg(theme::TEXT),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Press / to focus · Enter to search",
+                Style::default().fg(theme::TEXT_MUTED),
+            ));
+        }
+        SearchStatus::Loading => lines.push(Line::styled(
+            "Searching ZeroBeat…",
+            Style::default().fg(theme::ACCENT),
+        )),
+        SearchStatus::Failed(message) => lines.push(Line::styled(
+            format!("Search failed: {message}"),
+            Style::default().fg(ratatui::style::Color::LightRed),
+        )),
+        SearchStatus::Ready if app.search().results.is_empty() => lines.push(Line::styled(
+            "No results found. Try a different title or artist.",
+            Style::default().fg(theme::TEXT_MUTED),
+        )),
+        SearchStatus::Ready => {
+            for (index, track) in app.search().results.iter().enumerate() {
+                let selected = index == app.search().selected_index;
+                let marker = if selected { "▶" } else { " " };
+                let minutes = track.duration_ms / 60_000;
+                let seconds = track.duration_ms / 1_000 % 60;
+                let style = if selected {
+                    Style::default()
+                        .fg(theme::TEXT)
+                        .bg(theme::SURFACE_HIGH)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::TEXT_MUTED)
+                };
+                lines.push(Line::styled(
+                    format!(
+                        "{marker}  {}  ·  {}  {:02}:{:02}",
+                        track.title, track.artist, minutes, seconds
+                    ),
+                    style,
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "↑/↓ select · Enter play",
+                Style::default().fg(theme::TEXT_MUTED),
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(card().title(format!(" {} results ", app.search().results.len()))),
+        rows[1],
+    );
 }
 
 fn render_empty(frame: &mut Frame, area: Rect, title: &str, message: &str) {

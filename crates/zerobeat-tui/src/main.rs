@@ -1,4 +1,7 @@
-use std::io::{self, Stdout};
+use std::{
+    io::{self, Stdout},
+    time::Duration,
+};
 
 use crossterm::{
     event::{self, Event, KeyEventKind},
@@ -6,6 +9,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use zerobeat_protocol::{ClientCommand, SearchStatus};
 use zerobeat_runtime::socket_path;
 use zerobeat_tui::{App, connect_or_spawn, render};
 
@@ -17,6 +21,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while !app.should_quit() {
         terminal.draw(&app)?;
+        if !event::poll(Duration::from_millis(100))? {
+            if app.search().status == SearchStatus::Loading {
+                let snapshot = client.execute(ClientCommand::RequestSnapshot).await?;
+                app.replace_snapshot(snapshot);
+            }
+            continue;
+        }
         let Event::Key(key) = event::read()? else {
             continue;
         };

@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use zerobeat_core::Route;
-use zerobeat_protocol::ClientCommand;
+use zerobeat_core::{Route, Track};
+use zerobeat_protocol::{AppSnapshot, ClientCommand, SearchSnapshot, SearchStatus};
 use zerobeat_tui::{App, render};
 
 #[test]
@@ -56,6 +56,42 @@ fn navigation_and_search_keys_produce_daemon_commands() {
     );
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.handle_key(key(KeyCode::Esc)), Some(ClientCommand::Back));
+}
+
+#[test]
+fn enter_submits_search_and_results_can_be_selected() {
+    let mut app = App::default();
+    app.handle_key(key(KeyCode::Char('/')));
+    for character in "tampar".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(ClientCommand::SubmitSearch)
+    );
+
+    let mut snapshot = AppSnapshot::default();
+    snapshot.navigation.open(Route::Search);
+    snapshot.navigation.update_search("tampar");
+    snapshot.search = SearchSnapshot {
+        status: SearchStatus::Ready,
+        results: vec![
+            Track::new("one", "Tampar", "Juicy Luicy", 245_000),
+            Track::new("two", "Lantas", "Juicy Luicy", 234_000),
+        ],
+        selected_index: 0,
+        request_id: 1,
+    };
+    app.replace_snapshot(snapshot);
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Down)),
+        Some(ClientCommand::SelectNext)
+    );
+    let screen = render_screen(100, 30, &app);
+    assert!(screen.contains("Tampar"));
+    assert!(screen.contains("Juicy Luicy"));
 }
 
 fn render_screen(width: u16, height: u16, app: &App) -> String {
