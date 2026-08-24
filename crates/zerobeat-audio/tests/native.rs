@@ -4,7 +4,7 @@ use std::{
 };
 
 use tempfile::tempdir;
-use zerobeat_audio::{AudioBackend, NativeEngine, NativeState, StreamSource};
+use zerobeat_audio::{AudioBackend, NativeEngine, NativeState, SPECTRUM_BAND_COUNT, StreamSource};
 
 #[test]
 fn native_engine_prebuffers_local_audio_without_opening_an_output_device() {
@@ -75,6 +75,58 @@ fn native_engine_sends_stream_specific_http_headers() {
         server.join().unwrap(),
         "engine must use a bounded byte range"
     );
+}
+
+#[test]
+fn real_spectrum_places_a_440_hz_tone_in_the_expected_frequency_band() {
+    let samples = stereo_tone(440.0);
+
+    let spectrum = NativeEngine::analyze_spectrum(&samples, 2).unwrap();
+    let peak = spectrum
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, level)| *level)
+        .map(|(index, _)| index)
+        .unwrap();
+
+    assert_eq!(spectrum.len(), SPECTRUM_BAND_COUNT);
+    assert!(
+        (7..=9).contains(&peak),
+        "unexpected peak {peak}: {spectrum:?}"
+    );
+    assert!(spectrum[peak] >= 70, "weak peak: {spectrum:?}");
+}
+
+#[test]
+fn real_spectrum_tracks_bass_mid_and_treble_without_false_silence_energy() {
+    for (frequency, expected_band) in [(100.0, 2_usize), (3_000.0, 16), (10_000.0, 21)] {
+        let spectrum = NativeEngine::analyze_spectrum(&stereo_tone(frequency), 2).unwrap();
+        let peak = spectrum
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, level)| *level)
+            .map(|(index, _)| index)
+            .unwrap();
+        assert!(
+            peak.abs_diff(expected_band) <= 1,
+            "{frequency} Hz peaked in band {peak}: {spectrum:?}"
+        );
+        assert!(spectrum[peak] >= 70);
+    }
+
+    let silence = NativeEngine::analyze_spectrum(&vec![0.0; 8_192], 2).unwrap();
+    assert_eq!(silence, [0; SPECTRUM_BAND_COUNT]);
+}
+
+fn stereo_tone(frequency: f32) -> Vec<f32> {
+    const SAMPLE_RATE: usize = 48_000;
+    (0..4_096)
+        .flat_map(|frame| {
+            let phase = std::f32::consts::TAU * frequency * frame as f32 / SAMPLE_RATE as f32;
+            let sample = phase.sin() * 0.8;
+            [sample, sample]
+        })
+        .collect()
 }
 
 fn silent_wav(duration_ms: u32) -> Vec<u8> {

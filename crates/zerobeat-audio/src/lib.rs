@@ -7,7 +7,7 @@ mod native;
 mod player;
 mod queue;
 
-pub use backend::{AudioBackend, BackendTelemetry};
+pub use backend::{AudioBackend, BackendTelemetry, SPECTRUM_BAND_COUNT};
 pub use crossfade::{CrossfadeConfig, CrossfadeCurve};
 pub use dual_deck::DualDeck;
 pub use error::{BackendError, PlayerError};

@@ -4,6 +4,7 @@ use std::sync::{
 };
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 
 use zerobeat_audio::{AudioBackend, BackendError, BackendTelemetry, StreamSource};
 use zerobeat_catalog::{
@@ -13,7 +14,7 @@ use zerobeat_core::{Route, SessionMode, Track};
 use zerobeat_daemon::{DaemonError, DaemonServer};
 use zerobeat_ipc::IpcConnection;
 use zerobeat_protocol::{AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION, SearchStatus};
-use zerobeat_protocol::{DownloadStatus, LyricsStatus, PlaybackStatus};
+use zerobeat_protocol::{DownloadStatus, LyricsStatus, PlaybackStatus, RepeatMode};
 use zerobeat_storage::Database;
 
 #[tokio::test]
@@ -182,6 +183,117 @@ async fn search_runs_in_background_and_updates_the_snapshot() {
 }
 
 #[tokio::test]
+async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let server = DaemonServer::bind_with_services(
+        &socket,
+        TestCatalog,
+        RecordingBackend(Arc::clone(&events)),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+
+    let shuffled = exchange(&mut client, ClientCommand::ToggleShuffle).await;
+    let DaemonEvent::Snapshot(shuffled) = shuffled else {
+        panic!("expected snapshot");
+    };
+    assert!(shuffled.playback.shuffle);
+    let mut queued_ids = shuffled
+        .playback
+        .queue
+        .iter()
+        .map(|track| track.id.as_str())
+        .collect::<Vec<_>>();
+    queued_ids.sort_unstable();
+    assert_eq!(queued_ids, ["video-456", "video-789"]);
+
+    for expected in [RepeatMode::All, RepeatMode::One, RepeatMode::Off] {
+        let event = exchange(&mut client, ClientCommand::CycleRepeat).await;
+        let DaemonEvent::Snapshot(snapshot) = event else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(snapshot.playback.repeat_mode, expected);
+    }
+
+    exchange(&mut client, ClientCommand::SetVolume(35)).await;
+    let muted = exchange(&mut client, ClientCommand::ToggleMute).await;
+    let DaemonEvent::Snapshot(muted) = muted else {
+        panic!("expected snapshot");
+    };
+    assert!(muted.playback.muted);
+    assert_eq!(muted.playback.volume_percent, 0);
+    let restored = exchange(&mut client, ClientCommand::ToggleMute).await;
+    let DaemonEvent::Snapshot(restored) = restored else {
+        panic!("expected snapshot");
+    };
+    assert!(!restored.playback.muted);
+    assert_eq!(restored.playback.volume_percent, 35);
+
+    let next = exchange(&mut client, ClientCommand::NextTrack).await;
+    let DaemonEvent::Snapshot(next) = next else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(next.playback.history.len(), 1);
+    let next_title = next.playback.current.as_ref().unwrap().title.clone();
+    let previous = exchange(&mut client, ClientCommand::PreviousTrack).await;
+    let DaemonEvent::Snapshot(previous) = previous else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(previous.playback.current.as_ref().unwrap().title, "Tampar");
+    assert_eq!(previous.playback.queue[0].title, next_title);
+    assert!(previous.playback.history.is_empty());
+
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    let direct = Track::new("direct", "Direct Pick", "ZeroBeat", 180_000);
+    exchange(&mut client, ClientCommand::PlayTrack(direct)).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    let previous = exchange(&mut client, ClientCommand::PreviousTrack).await;
+    let DaemonEvent::Snapshot(previous) = previous else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(previous.playback.current.as_ref().unwrap().title, "Tampar");
+    let queue_len = previous.playback.queue.len();
+
+    let removed = exchange(&mut client, ClientCommand::RemoveQueueIndex(0)).await;
+    let DaemonEvent::Snapshot(removed) = removed else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(removed.playback.queue.len(), queue_len - 1);
+    let cleared = exchange(&mut client, ClientCommand::ClearQueue).await;
+    let DaemonEvent::Snapshot(cleared) = cleared else {
+        panic!("expected snapshot");
+    };
+    assert!(cleared.playback.queue.is_empty());
+
+    assert!(events.lock().unwrap().contains(&"volume:0.350".to_owned()));
+    assert!(events.lock().unwrap().contains(&"volume:0.000".to_owned()));
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn playback_auto_advances_before_the_current_track_ends() {
     let directory = tempdir().unwrap();
     let socket = directory.path().join("zerobeat.sock");
@@ -212,6 +324,18 @@ async fn playback_auto_advances_before_the_current_track_ends() {
     })
     .await;
 
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.spectrum == [48; 24]
+    })
+    .await;
+    let paused = exchange(&mut client, ClientCommand::TogglePlayback).await;
+    let DaemonEvent::Snapshot(paused) = paused else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(paused.playback.status, PlaybackStatus::Paused);
+    assert_eq!(paused.playback.spectrum, [0; 24]);
+    exchange(&mut client, ClientCommand::TogglePlayback).await;
+
     near_end.store(true, Ordering::Release);
     let advanced = wait_for(&mut client, |snapshot| {
         snapshot.playback.status == PlaybackStatus::Playing
@@ -220,15 +344,185 @@ async fn playback_auto_advances_before_the_current_track_ends() {
                 .current
                 .as_ref()
                 .is_some_and(|track| track.title == "Sialan")
+            && snapshot.playback.spectrum == [48; 24]
     })
     .await;
     assert_eq!(advanced.playback.queue.len(), 1);
+    assert_eq!(advanced.playback.spectrum, [48; 24]);
     assert!(
         events
             .lock()
             .unwrap()
             .contains(&"load:https://stream.example/sialan")
     );
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn repeat_one_restarts_the_current_track_without_consuming_the_queue() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ended = Arc::new(AtomicBool::new(false));
+    let server = DaemonServer::bind_with_services(
+        &socket,
+        TestCatalog,
+        RepeatBackend {
+            events: Arc::clone(&events),
+            ended: Arc::clone(&ended),
+        },
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    exchange(&mut client, ClientCommand::CycleRepeat).await;
+    exchange(&mut client, ClientCommand::CycleRepeat).await;
+
+    ended.store(true, Ordering::Release);
+    let repeated = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| **event == "load:https://stream.example/tampar")
+                .count()
+                >= 2
+    })
+    .await;
+    assert_eq!(repeated.playback.current.as_ref().unwrap().title, "Tampar");
+    assert_eq!(repeated.playback.queue.len(), 2);
+    assert!(repeated.playback.history.is_empty());
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn skipping_a_resolving_track_with_an_empty_queue_cancels_its_start() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let resolve_started = Arc::new(Notify::new());
+    let release_resolve = Arc::new(Notify::new());
+    let server = DaemonServer::bind_with_services(
+        &socket,
+        DelayedCatalog {
+            resolve_started: Arc::clone(&resolve_started),
+            release_resolve: Arc::clone(&release_resolve),
+        },
+        RecordingBackend(Arc::clone(&events)),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+
+    exchange(
+        &mut client,
+        ClientCommand::PlayTrack(Track::new("delayed", "Delayed", "ZeroBeat", 60_000)),
+    )
+    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        resolve_started.notified(),
+    )
+    .await
+    .expect("stream resolution did not start");
+
+    let stopped = exchange(&mut client, ClientCommand::NextTrack).await;
+    let DaemonEvent::Snapshot(stopped) = stopped else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(stopped.playback.status, PlaybackStatus::Idle);
+    assert!(stopped.playback.current.is_none());
+
+    release_resolve.notify_waiters();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let settled = exchange(&mut client, ClientCommand::RequestSnapshot).await;
+    let DaemonEvent::Snapshot(settled) = settled else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(settled.playback.status, PlaybackStatus::Idle);
+    assert!(settled.playback.current.is_none());
+    assert_eq!(*events.lock().unwrap(), ["stop"]);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_track_superseded_during_blocking_load_never_starts() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let first_load_started = Arc::new(AtomicBool::new(false));
+    let release_first_load = Arc::new(AtomicBool::new(false));
+    let server = DaemonServer::bind_with_services(
+        &socket,
+        TestCatalog,
+        BlockingLoadBackend {
+            events: Arc::clone(&events),
+            loaded: String::new(),
+            first_load_started: Arc::clone(&first_load_started),
+            release_first_load: Arc::clone(&release_first_load),
+        },
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+
+    exchange(
+        &mut client,
+        ClientCommand::PlayTrack(Track::new("video-123", "First", "ZeroBeat", 60_000)),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !first_load_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first load did not start");
+
+    exchange(
+        &mut client,
+        ClientCommand::PlayTrack(Track::new("video-456", "Second", "ZeroBeat", 60_000)),
+    )
+    .await;
+    release_first_load.store(true, Ordering::Release);
+
+    let playing = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && snapshot
+                .playback
+                .current
+                .as_ref()
+                .is_some_and(|track| track.id == "video-456")
+    })
+    .await;
+    assert_eq!(playing.playback.current.as_ref().unwrap().title, "Second");
+    {
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|event| event == "play:video-123"));
+        assert!(events.iter().any(|event| event == "play:video-456"));
+    }
 
     exchange(&mut client, ClientCommand::Shutdown).await;
     server_task.await.unwrap().unwrap();
@@ -502,6 +796,34 @@ struct DownloadCatalog {
 
 struct FailingCatalog;
 
+struct DelayedCatalog {
+    resolve_started: Arc<Notify>,
+    release_resolve: Arc<Notify>,
+}
+
+impl MusicCatalog for DelayedCatalog {
+    fn search_songs(&self, _request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn resolve_stream(
+        &self,
+        track_id: &str,
+        _quality: AudioQuality,
+    ) -> CatalogFuture<'_, ResolvedStream> {
+        let track_id = track_id.to_owned();
+        let resolve_started = Arc::clone(&self.resolve_started);
+        let release_resolve = Arc::clone(&self.release_resolve);
+        Box::pin(async move {
+            resolve_started.notify_one();
+            release_resolve.notified().await;
+            Ok(ResolvedStream::new(format!(
+                "https://stream.example/{track_id}"
+            )))
+        })
+    }
+}
+
 impl MusicCatalog for FailingCatalog {
     fn search_songs(&self, _request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
         Box::pin(async {
@@ -591,6 +913,52 @@ struct AutoAdvanceBackend {
     near_end: Arc<AtomicBool>,
 }
 
+struct RepeatBackend {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    ended: Arc<AtomicBool>,
+}
+
+struct BlockingLoadBackend {
+    events: Arc<Mutex<Vec<String>>>,
+    loaded: String,
+    first_load_started: Arc<AtomicBool>,
+    release_first_load: Arc<AtomicBool>,
+}
+
+impl AudioBackend for BlockingLoadBackend {
+    fn load(&mut self, source: &StreamSource) -> Result<(), BackendError> {
+        self.loaded = source.url.rsplit('/').next().unwrap_or_default().to_owned();
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("load:{}", self.loaded));
+        if self.loaded == "video-123" {
+            self.first_load_started.store(true, Ordering::Release);
+            while !self.release_first_load.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), BackendError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("play:{}", self.loaded));
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), BackendError> {
+        self.events.lock().unwrap().push("stop".to_owned());
+        Ok(())
+    }
+}
+
 impl AudioBackend for RecordingBackend {
     fn load(&mut self, source: &StreamSource) -> Result<(), BackendError> {
         let event = match source.url.rsplit('/').next() {
@@ -614,6 +982,16 @@ impl AudioBackend for RecordingBackend {
 
     fn stop(&mut self) -> Result<(), BackendError> {
         self.0.lock().unwrap().push("stop".to_owned());
+        Ok(())
+    }
+
+    fn seek(&mut self, position_ms: u64) -> Result<(), BackendError> {
+        self.0.lock().unwrap().push(format!("seek:{position_ms}"));
+        Ok(())
+    }
+
+    fn set_volume(&mut self, volume: f32) -> Result<(), BackendError> {
+        self.0.lock().unwrap().push(format!("volume:{volume:.3}"));
         Ok(())
     }
 }
@@ -652,6 +1030,43 @@ impl AudioBackend for AutoAdvanceBackend {
             },
             duration_ms: 245_000,
             buffered_ms: 245_000,
+            spectrum: [48; 24],
+            ..BackendTelemetry::default()
+        }
+    }
+}
+
+impl AudioBackend for RepeatBackend {
+    fn load(&mut self, source: &StreamSource) -> Result<(), BackendError> {
+        let event = match source.url.rsplit('/').next() {
+            Some("video-123") => "load:https://stream.example/tampar",
+            Some("video-456") => "load:https://stream.example/sialan",
+            _ => "load:https://stream.example/other",
+        };
+        self.events.lock().unwrap().push(event);
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), BackendError> {
+        self.events.lock().unwrap().push("play");
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), BackendError> {
+        self.events.lock().unwrap().push("stop");
+        Ok(())
+    }
+
+    fn telemetry(&self) -> BackendTelemetry {
+        BackendTelemetry {
+            position_ms: 245_000,
+            duration_ms: 245_000,
+            buffered_ms: 245_000,
+            ended: self.ended.swap(false, Ordering::AcqRel),
             ..BackendTelemetry::default()
         }
     }

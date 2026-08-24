@@ -3,6 +3,7 @@ use std::{error::Error, ffi::OsString, path::PathBuf};
 use zerobeat_api::{ApiCatalog, ApiConfig};
 use zerobeat_audio::{DualDeck, NativeEngine};
 use zerobeat_daemon::DaemonServer;
+use zerobeat_protocol::PROTOCOL_VERSION;
 use zerobeat_runtime::{current_data_dir, prepare_data_dir, prepare_runtime_dir, socket_path};
 use zerobeat_storage::Database;
 
@@ -39,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn parse_socket(mut arguments: impl Iterator<Item = OsString>) -> Result<PathBuf, &'static str> {
     match arguments.next() {
-        None => Ok(socket_path()),
+        None => Ok(socket_path(PROTOCOL_VERSION)),
         Some(flag) if flag == "--socket" => arguments
             .next()
             .map(PathBuf::from)

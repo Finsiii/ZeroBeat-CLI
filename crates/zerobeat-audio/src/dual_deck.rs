@@ -83,14 +83,32 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
         source: &StreamSource,
         duration: Duration,
     ) -> Result<(), BackendError> {
+        self.transition_to_guarded(source, duration, &|| true)
+    }
+
+    fn transition_to_guarded(
+        &mut self,
+        source: &StreamSource,
+        duration: Duration,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<(), BackendError> {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         {
             let mut state = lock_decks(&self.inner)?;
             let incoming = 1 - state.active;
             state.decks[incoming].stop()?;
+            if !should_continue() {
+                return Ok(());
+            }
             state.decks[incoming].load(source)?;
+            if !should_continue() {
+                return state.decks[incoming].stop();
+            }
             state.decks[incoming].set_volume(0.0)?;
             state.decks[incoming].play()?;
+            if !should_continue() {
+                return state.decks[incoming].stop();
+            }
             state.incoming = Some(incoming);
             state.progress = 0.0;
         }

@@ -1,8 +1,14 @@
 use zerobeat_core::{NavigationState, Route, SessionMode, Track};
 use zerobeat_protocol::{
     AppSnapshot, ClientCommand, DaemonEvent, PROTOCOL_VERSION, PlaybackSnapshot, PlaybackStatus,
-    SearchSnapshot, SearchStatus, decode, encode,
+    RepeatMode, SearchSnapshot, SearchStatus, decode, encode,
 };
+
+#[derive(Debug, serde::Deserialize, PartialEq)]
+enum LegacyControlCommand {
+    Hello { protocol_version: u16 },
+    Shutdown,
+}
 
 #[test]
 fn command_round_trips_without_losing_payload() {
@@ -22,7 +28,15 @@ fn command_round_trips_without_losing_payload() {
         ClientCommand::ToggleLyrics,
         ClientCommand::SetCrossfadeSeconds(8),
         ClientCommand::TogglePlayback,
+        ClientCommand::PreviousTrack,
         ClientCommand::NextTrack,
+        ClientCommand::ToggleShuffle,
+        ClientCommand::CycleRepeat,
+        ClientCommand::ToggleMute,
+        ClientCommand::SeekTo(90_000),
+        ClientCommand::PlayQueueIndex(2),
+        ClientCommand::RemoveQueueIndex(1),
+        ClientCommand::ClearQueue,
         ClientCommand::RequestSnapshot,
         ClientCommand::Shutdown,
     ];
@@ -58,6 +72,13 @@ fn snapshot_event_round_trips_with_guest_navigation_state() {
             error: None,
             request_id: 1,
             queue: vec![Track::new("video-2", "Sialan", "Juicy Luicy", 242_000)],
+            history: Vec::new(),
+            shuffle: true,
+            repeat_mode: RepeatMode::All,
+            muted: false,
+            volume_before_mute: 80,
+            spectrum: [32; 24],
+            underrun_count: 2,
         },
         library: Default::default(),
         lyrics: Default::default(),
@@ -75,4 +96,24 @@ fn malformed_payload_is_rejected() {
     let result = decode::<ClientCommand>(&[0xc1]);
 
     assert!(result.is_err());
+}
+
+#[test]
+fn hello_and_shutdown_remain_readable_by_legacy_daemons() {
+    let hello = encode(&ClientCommand::Hello {
+        protocol_version: PROTOCOL_VERSION,
+    })
+    .unwrap();
+    let shutdown = encode(&ClientCommand::Shutdown).unwrap();
+
+    assert_eq!(
+        decode::<LegacyControlCommand>(&hello).unwrap(),
+        LegacyControlCommand::Hello {
+            protocol_version: PROTOCOL_VERSION
+        }
+    );
+    assert_eq!(
+        decode::<LegacyControlCommand>(&shutdown).unwrap(),
+        LegacyControlCommand::Shutdown
+    );
 }

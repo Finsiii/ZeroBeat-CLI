@@ -3,7 +3,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::{AudioBackend, BackendError, BackendTelemetry, StreamSource};
+use crate::{AudioBackend, BackendError, BackendTelemetry, SPECTRUM_BAND_COUNT, StreamSource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeState {
@@ -57,6 +57,48 @@ impl NativeEngine {
 
     pub fn underrun_count(&self) -> u64 {
         non_negative(unsafe { zb_engine_get_underrun_count(self.raw.as_ptr()) })
+    }
+
+    pub fn spectrum(&self) -> [u8; SPECTRUM_BAND_COUNT] {
+        let mut bands = [0; SPECTRUM_BAND_COUNT];
+        let result = unsafe {
+            zb_engine_get_spectrum(
+                self.raw.as_ptr(),
+                bands.as_mut_ptr(),
+                i32::try_from(bands.len()).unwrap_or(i32::MAX),
+            )
+        };
+        if result == 0 {
+            bands
+        } else {
+            [0; SPECTRUM_BAND_COUNT]
+        }
+    }
+
+    pub fn analyze_spectrum(
+        samples: &[f32],
+        channels: u8,
+    ) -> Result<[u8; SPECTRUM_BAND_COUNT], BackendError> {
+        if channels == 0 || samples.is_empty() || !samples.len().is_multiple_of(channels.into()) {
+            return Err(BackendError::Failed("invalid spectrum PCM shape".into()));
+        }
+        let mut bands = [0; SPECTRUM_BAND_COUNT];
+        let result = unsafe {
+            zb_engine_analyze_spectrum(
+                samples.as_ptr(),
+                i64::try_from(samples.len()).unwrap_or(i64::MAX),
+                i32::from(channels),
+                bands.as_mut_ptr(),
+                i32::try_from(bands.len()).unwrap_or(i32::MAX),
+            )
+        };
+        if result == 0 {
+            Ok(bands)
+        } else {
+            Err(BackendError::Failed(format!(
+                "native spectrum analysis failed with code {result}"
+            )))
+        }
     }
 
     pub fn seek(&mut self, position_ms: u64) -> Result<(), BackendError> {
@@ -154,6 +196,7 @@ impl AudioBackend for NativeEngine {
             duration_ms: self.duration_ms(),
             buffered_ms: self.buffered_ms(),
             underrun_count: self.underrun_count(),
+            spectrum: self.spectrum(),
             ended: self.state() == NativeState::Ended,
         }
     }
@@ -196,5 +239,13 @@ unsafe extern "C" {
     fn zb_engine_get_duration_ms(engine: *mut ZbEngine) -> i64;
     fn zb_engine_get_buffered_ms(engine: *mut ZbEngine) -> i64;
     fn zb_engine_get_underrun_count(engine: *mut ZbEngine) -> i64;
+    fn zb_engine_get_spectrum(engine: *mut ZbEngine, bands: *mut u8, band_count: c_int) -> c_int;
+    fn zb_engine_analyze_spectrum(
+        samples: *const f32,
+        sample_count: i64,
+        channels: c_int,
+        bands: *mut u8,
+        band_count: c_int,
+    ) -> c_int;
     fn zb_engine_get_last_error(engine: *mut ZbEngine) -> *const c_char;
 }

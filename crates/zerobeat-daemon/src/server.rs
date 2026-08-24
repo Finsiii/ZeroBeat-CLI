@@ -1,7 +1,10 @@
 use std::{
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,7 +20,7 @@ use zerobeat_core::Track;
 use zerobeat_ipc::IpcConnection;
 use zerobeat_protocol::{
     AppSnapshot, ClientCommand, DaemonEvent, DownloadSnapshot, DownloadStatus, LibrarySnapshot,
-    LyricsLineSnapshot, LyricsStatus, PROTOCOL_VERSION, PlaybackStatus, SearchStatus,
+    LyricsLineSnapshot, LyricsStatus, PROTOCOL_VERSION, PlaybackStatus, RepeatMode, SearchStatus,
     SettingsSnapshot,
 };
 use zerobeat_storage::{Database, DownloadState};
@@ -27,7 +30,7 @@ use crate::{DaemonError, download::spawn_download};
 pub struct DaemonServer {
     listener: UnixListener,
     socket_path: PathBuf,
-    state: Arc<Mutex<AppSnapshot>>,
+    playback: PlaybackCoordinator,
     catalog: Arc<dyn MusicCatalog>,
     audio: SharedAudio,
     storage: SharedStorage,
@@ -36,6 +39,12 @@ pub struct DaemonServer {
 
 type SharedAudio = Arc<StdMutex<Box<dyn AudioBackend>>>;
 type SharedStorage = Arc<StdMutex<Database>>;
+
+#[derive(Clone)]
+struct PlaybackCoordinator {
+    state: Arc<Mutex<AppSnapshot>>,
+    generation: Arc<AtomicU64>,
+}
 
 const CROSSFADE_PREPARE_LEAD: Duration = Duration::from_secs(2);
 
@@ -94,7 +103,10 @@ impl DaemonServer {
         Ok(Self {
             listener,
             socket_path,
-            state: Arc::new(Mutex::new(state)),
+            playback: PlaybackCoordinator {
+                state: Arc::new(Mutex::new(state)),
+                generation: Arc::new(AtomicU64::new(0)),
+            },
             catalog: Arc::new(catalog),
             audio: Arc::new(StdMutex::new(Box::new(audio))),
             storage: Arc::new(StdMutex::new(storage)),
@@ -110,7 +122,7 @@ impl DaemonServer {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
-                    let state = Arc::clone(&self.state);
+                    let playback = self.playback.clone();
                     let catalog = Arc::clone(&self.catalog);
                     let audio = Arc::clone(&self.audio);
                     let storage = Arc::clone(&self.storage);
@@ -119,7 +131,7 @@ impl DaemonServer {
                     tokio::spawn(async move {
                         let _ = handle_client(
                             stream,
-                            state,
+                            playback,
                             catalog,
                             audio,
                             storage,
@@ -130,7 +142,7 @@ impl DaemonServer {
                 }
                 _ = telemetry_tick.tick() => {
                     refresh_playback_telemetry(
-                        &self.state,
+                        &self.playback,
                         &self.catalog,
                         &self.audio,
                         &self.storage,
@@ -157,7 +169,7 @@ impl DaemonServer {
 
 async fn handle_client(
     stream: UnixStream,
-    state: Arc<Mutex<AppSnapshot>>,
+    playback: PlaybackCoordinator,
     catalog: Arc<dyn MusicCatalog>,
     audio: SharedAudio,
     storage: SharedStorage,
@@ -184,7 +196,7 @@ async fn handle_client(
 
         let (event, should_shutdown) = apply_command(
             command,
-            &state,
+            &playback,
             &catalog,
             &audio,
             &storage,
@@ -201,12 +213,14 @@ async fn handle_client(
 
 async fn apply_command(
     command: ClientCommand,
-    state: &Arc<Mutex<AppSnapshot>>,
+    playback: &PlaybackCoordinator,
     catalog: &Arc<dyn MusicCatalog>,
     audio: &SharedAudio,
     storage: &SharedStorage,
     download_directory: &Arc<PathBuf>,
 ) -> (DaemonEvent, bool) {
+    let state = &playback.state;
+    let playback_generation = &playback.generation;
     match command {
         ClientCommand::Hello { protocol_version } if protocol_version != PROTOCOL_VERSION => (
             DaemonEvent::Rejected(format!("unsupported protocol version {protocol_version}")),
@@ -300,14 +314,8 @@ async fn apply_command(
             let Some(track) = snapshot.search.results.get(selected_index).cloned() else {
                 return (snapshot_event(snapshot.clone()), false);
             };
-            snapshot.playback.request_id = snapshot.playback.request_id.saturating_add(1);
-            let request_id = snapshot.playback.request_id;
-            snapshot.playback.current = Some(track.clone());
-            snapshot.playback.position_ms = 0;
-            snapshot.playback.duration_ms = track.duration_ms;
-            snapshot.playback.buffered_ms = 0;
-            snapshot.playback.error = None;
-            snapshot.playback.status = PlaybackStatus::Resolving;
+            remember_current(&mut snapshot);
+            let request_id = prepare_track(&mut snapshot, playback_generation, &track);
             snapshot.playback.queue = snapshot
                 .search
                 .results
@@ -321,7 +329,7 @@ async fn apply_command(
             spawn_playback(
                 track,
                 request_id,
-                Arc::clone(state),
+                playback.clone(),
                 Arc::clone(catalog),
                 Arc::clone(audio),
                 Arc::clone(storage),
@@ -364,20 +372,14 @@ async fn apply_command(
             } else {
                 PlaybackStart::Replace
             };
-            snapshot.playback.request_id = snapshot.playback.request_id.saturating_add(1);
-            let request_id = snapshot.playback.request_id;
-            snapshot.playback.current = Some(track.clone());
-            snapshot.playback.position_ms = 0;
-            snapshot.playback.duration_ms = track.duration_ms;
-            snapshot.playback.buffered_ms = 0;
-            snapshot.playback.error = None;
-            snapshot.playback.status = PlaybackStatus::Resolving;
+            remember_current(&mut snapshot);
+            let request_id = prepare_track(&mut snapshot, playback_generation, &track);
             let event = snapshot_event(snapshot.clone());
             drop(snapshot);
             spawn_playback(
                 track,
                 request_id,
-                Arc::clone(state),
+                playback.clone(),
                 Arc::clone(catalog),
                 Arc::clone(audio),
                 Arc::clone(storage),
@@ -518,6 +520,7 @@ async fn apply_command(
                 set_playback_error(&mut snapshot, error);
             } else if current == PlaybackStatus::Playing {
                 snapshot.playback.status = PlaybackStatus::Paused;
+                snapshot.playback.spectrum = [0; 24];
             } else if current == PlaybackStatus::Paused {
                 snapshot.playback.status = PlaybackStatus::Playing;
             }
@@ -525,9 +528,10 @@ async fn apply_command(
         }
         ClientCommand::NextTrack => {
             let mut snapshot = state.lock().await;
-            snapshot.playback.request_id = snapshot.playback.request_id.saturating_add(1);
-            let request_id = snapshot.playback.request_id;
-            let Some(track) = snapshot.playback.queue.first().cloned() else {
+            remember_current(&mut snapshot);
+            refill_repeat_queue(&mut snapshot);
+            let Some(track) = take_queue_track(&mut snapshot, 0) else {
+                invalidate_playback(&mut snapshot, playback_generation);
                 drop(snapshot);
                 let result = run_audio(Arc::clone(audio), |audio| audio.stop()).await;
                 let mut snapshot = state.lock().await;
@@ -540,28 +544,124 @@ async fn apply_command(
                 snapshot.playback.position_ms = 0;
                 snapshot.playback.duration_ms = 0;
                 snapshot.playback.buffered_ms = 0;
+                snapshot.playback.spectrum = [0; 24];
                 snapshot.playback.error = None;
                 return (snapshot_event(snapshot.clone()), false);
             };
-            snapshot.playback.queue.remove(0);
-            snapshot.playback.current = Some(track.clone());
-            snapshot.playback.position_ms = 0;
-            snapshot.playback.duration_ms = track.duration_ms;
-            snapshot.playback.buffered_ms = 0;
-            snapshot.playback.error = None;
-            snapshot.playback.status = PlaybackStatus::Resolving;
+            let request_id = prepare_track(&mut snapshot, playback_generation, &track);
             let event = snapshot_event(snapshot.clone());
             drop(snapshot);
             spawn_playback(
                 track,
                 request_id,
-                Arc::clone(state),
+                playback.clone(),
                 Arc::clone(catalog),
                 Arc::clone(audio),
                 Arc::clone(storage),
                 PlaybackStart::Crossfade(Duration::from_millis(500)),
             );
             (event, false)
+        }
+        ClientCommand::PreviousTrack => {
+            let restart_current = state.lock().await.playback.position_ms > 3_000;
+            if restart_current {
+                return seek_to(0, state, audio).await;
+            }
+            let mut snapshot = state.lock().await;
+            let Some(track) = snapshot.playback.history.pop() else {
+                drop(snapshot);
+                return seek_to(0, state, audio).await;
+            };
+            if let Some(current) = snapshot.playback.current.take() {
+                snapshot.playback.queue.insert(0, current);
+            }
+            let request_id = prepare_track(&mut snapshot, playback_generation, &track);
+            let event = snapshot_event(snapshot.clone());
+            drop(snapshot);
+            spawn_playback(
+                track,
+                request_id,
+                playback.clone(),
+                Arc::clone(catalog),
+                Arc::clone(audio),
+                Arc::clone(storage),
+                PlaybackStart::Crossfade(Duration::from_millis(500)),
+            );
+            (event, false)
+        }
+        ClientCommand::ToggleShuffle => {
+            let mut snapshot = state.lock().await;
+            snapshot.playback.shuffle = !snapshot.playback.shuffle;
+            if snapshot.playback.shuffle {
+                let seed = shuffle_seed(snapshot.playback.request_id);
+                shuffle_tracks(&mut snapshot.playback.queue, seed);
+            }
+            (snapshot_event(snapshot.clone()), false)
+        }
+        ClientCommand::CycleRepeat => {
+            let mut snapshot = state.lock().await;
+            snapshot.playback.repeat_mode = match snapshot.playback.repeat_mode {
+                RepeatMode::Off => RepeatMode::All,
+                RepeatMode::All => RepeatMode::One,
+                RepeatMode::One => RepeatMode::Off,
+            };
+            (snapshot_event(snapshot.clone()), false)
+        }
+        ClientCommand::ToggleMute => {
+            let (percent, muted) = {
+                let snapshot = state.lock().await;
+                if snapshot.playback.muted {
+                    (snapshot.playback.volume_before_mute.max(1), false)
+                } else {
+                    (0, true)
+                }
+            };
+            let result = run_audio(Arc::clone(audio), move |audio| {
+                audio.set_volume(f32::from(percent) / 100.0)
+            })
+            .await;
+            let mut snapshot = state.lock().await;
+            if let Err(error) = result {
+                set_playback_error(&mut snapshot, error);
+            } else {
+                if muted && snapshot.playback.volume_percent > 0 {
+                    snapshot.playback.volume_before_mute = snapshot.playback.volume_percent;
+                }
+                snapshot.playback.volume_percent = percent;
+                snapshot.playback.muted = muted;
+            }
+            (snapshot_event(snapshot.clone()), false)
+        }
+        ClientCommand::SeekTo(position_ms) => seek_to(position_ms, state, audio).await,
+        ClientCommand::PlayQueueIndex(index) => {
+            let mut snapshot = state.lock().await;
+            let Some(track) = take_queue_track(&mut snapshot, index) else {
+                return (snapshot_event(snapshot.clone()), false);
+            };
+            remember_current(&mut snapshot);
+            let request_id = prepare_track(&mut snapshot, playback_generation, &track);
+            let event = snapshot_event(snapshot.clone());
+            drop(snapshot);
+            spawn_playback(
+                track,
+                request_id,
+                playback.clone(),
+                Arc::clone(catalog),
+                Arc::clone(audio),
+                Arc::clone(storage),
+                PlaybackStart::Crossfade(Duration::from_millis(500)),
+            );
+            (event, false)
+        }
+        ClientCommand::RemoveQueueIndex(index) => {
+            let mut snapshot = state.lock().await;
+            let _ = take_queue_track(&mut snapshot, index);
+            (snapshot_event(snapshot.clone()), false)
+        }
+        ClientCommand::ClearQueue => {
+            let mut snapshot = state.lock().await;
+            snapshot.playback.queue.clear();
+            (snapshot_event(snapshot.clone()), false)
         }
         ClientCommand::SeekRelative(offset_ms) => {
             let target = {
@@ -590,10 +690,111 @@ async fn apply_command(
                 set_playback_error(&mut snapshot, error);
             } else {
                 snapshot.playback.volume_percent = percent;
+                if percent > 0 {
+                    snapshot.playback.volume_before_mute = percent;
+                    snapshot.playback.muted = false;
+                } else {
+                    snapshot.playback.muted = true;
+                }
             }
             (snapshot_event(snapshot.clone()), false)
         }
         ClientCommand::Shutdown => (DaemonEvent::Acknowledged, true),
+    }
+}
+
+async fn seek_to(
+    position_ms: u64,
+    state: &Arc<Mutex<AppSnapshot>>,
+    audio: &SharedAudio,
+) -> (DaemonEvent, bool) {
+    let target = {
+        let snapshot = state.lock().await;
+        position_ms.min(snapshot.playback.duration_ms)
+    };
+    let result = run_audio(Arc::clone(audio), move |audio| audio.seek(target)).await;
+    let mut snapshot = state.lock().await;
+    if let Err(error) = result {
+        set_playback_error(&mut snapshot, error);
+    } else {
+        snapshot.playback.position_ms = target;
+    }
+    (snapshot_event(snapshot.clone()), false)
+}
+
+fn prepare_track(
+    snapshot: &mut AppSnapshot,
+    playback_generation: &AtomicU64,
+    track: &Track,
+) -> u64 {
+    snapshot.playback.request_id = snapshot.playback.request_id.saturating_add(1);
+    playback_generation.store(snapshot.playback.request_id, Ordering::Release);
+    snapshot.playback.current = Some(track.clone());
+    snapshot.playback.position_ms = 0;
+    snapshot.playback.duration_ms = track.duration_ms;
+    snapshot.playback.buffered_ms = 0;
+    snapshot.playback.spectrum = [0; 24];
+    snapshot.playback.error = None;
+    snapshot.playback.status = PlaybackStatus::Resolving;
+    snapshot.playback.request_id
+}
+
+fn invalidate_playback(snapshot: &mut AppSnapshot, playback_generation: &AtomicU64) {
+    snapshot.playback.request_id = snapshot.playback.request_id.saturating_add(1);
+    playback_generation.store(snapshot.playback.request_id, Ordering::Release);
+}
+
+fn remember_current(snapshot: &mut AppSnapshot) {
+    if let Some(current) = snapshot.playback.current.take()
+        && snapshot.playback.history.last().map(|track| &track.id) != Some(&current.id)
+    {
+        snapshot.playback.history.push(current);
+        if snapshot.playback.history.len() > 100 {
+            snapshot.playback.history.remove(0);
+        }
+    }
+}
+
+fn take_queue_track(snapshot: &mut AppSnapshot, index: usize) -> Option<Track> {
+    (index < snapshot.playback.queue.len()).then(|| snapshot.playback.queue.remove(index))
+}
+
+fn refill_repeat_queue(snapshot: &mut AppSnapshot) {
+    if snapshot.playback.queue.is_empty() && snapshot.playback.repeat_mode == RepeatMode::All {
+        snapshot.playback.queue = std::mem::take(&mut snapshot.playback.history);
+        if snapshot.playback.shuffle {
+            let seed = shuffle_seed(snapshot.playback.request_id);
+            shuffle_tracks(&mut snapshot.playback.queue, seed);
+        }
+    }
+}
+
+fn shuffle_seed(request_id: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+        ^ request_id.rotate_left(17)
+}
+
+fn shuffle_tracks(tracks: &mut [Track], mut seed: u64) {
+    if tracks.len() < 2 {
+        return;
+    }
+    let original = tracks
+        .iter()
+        .map(|track| track.id.clone())
+        .collect::<Vec<_>>();
+    for upper in (1..tracks.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let index = usize::try_from(seed % u64::try_from(upper + 1).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        tracks.swap(upper, index);
+    }
+    if tracks.iter().map(|track| &track.id).eq(original.iter()) {
+        tracks.rotate_left(1);
     }
 }
 
@@ -604,13 +805,14 @@ fn snapshot_event(snapshot: AppSnapshot) -> DaemonEvent {
 fn spawn_playback(
     track: Track,
     request_id: u64,
-    state: Arc<Mutex<AppSnapshot>>,
+    playback: PlaybackCoordinator,
     catalog: Arc<dyn MusicCatalog>,
     audio: SharedAudio,
     storage: SharedStorage,
     start: PlaybackStart,
 ) {
     tokio::spawn(async move {
+        let state = &playback.state;
         let local_path = storage.lock().ok().and_then(|database| {
             database
                 .download(&track.id)
@@ -632,7 +834,7 @@ fn spawn_playback(
             {
                 Ok(stream) => stream,
                 Err(error) => {
-                    finish_playback_error(&state, request_id, error.to_string()).await;
+                    finish_playback_error(state, request_id, error.to_string()).await;
                     return;
                 }
             }
@@ -646,21 +848,41 @@ fn spawn_playback(
         }
         let mut source = StreamSource::new(stream.url);
         source.headers = stream.headers;
-        let result = run_audio(audio, move |audio| match start {
-            PlaybackStart::Replace => {
-                let _ = audio.stop();
-                audio.load(&source)?;
-                audio.play()
-            }
-            PlaybackStart::Crossfade(duration) => audio.transition_to(&source, duration),
-        })
+        let operation_generation = Arc::clone(&playback.generation);
+        let result = run_playback_audio(
+            audio,
+            Arc::clone(&playback.generation),
+            request_id,
+            move |audio| match start {
+                PlaybackStart::Replace => {
+                    let _ = audio.stop();
+                    if operation_generation.load(Ordering::Acquire) != request_id {
+                        return Ok(());
+                    }
+                    audio.load(&source)?;
+                    if operation_generation.load(Ordering::Acquire) != request_id {
+                        return audio.stop();
+                    }
+                    audio.play()?;
+                    if operation_generation.load(Ordering::Acquire) != request_id {
+                        return audio.stop();
+                    }
+                    Ok(())
+                }
+                PlaybackStart::Crossfade(duration) => {
+                    audio.transition_to_guarded(&source, duration, &|| {
+                        operation_generation.load(Ordering::Acquire) == request_id
+                    })
+                }
+            },
+        )
         .await;
         let mut snapshot = state.lock().await;
         if snapshot.playback.request_id != request_id {
             return;
         }
         match result {
-            Ok(()) => {
+            PlaybackRun::Completed(Ok(())) => {
                 snapshot.playback.status = PlaybackStatus::Playing;
                 if let Ok(database) = storage.lock()
                     && database.record_play(&track, unix_time()).is_ok()
@@ -674,13 +896,14 @@ fn spawn_playback(
                     snapshot.lyrics.lines.clear();
                     spawn_lyrics(
                         track,
-                        Arc::clone(&state),
+                        Arc::clone(state),
                         Arc::clone(&catalog),
                         Arc::clone(&storage),
                     );
                 }
             }
-            Err(error) => set_playback_error(&mut snapshot, error),
+            PlaybackRun::Completed(Err(error)) => set_playback_error(&mut snapshot, error),
+            PlaybackRun::Stale => {}
         }
     });
 }
@@ -750,6 +973,37 @@ async fn run_audio(
     .map_err(|error| format!("audio worker failed: {error}"))?
 }
 
+enum PlaybackRun {
+    Completed(Result<(), String>),
+    Stale,
+}
+
+async fn run_playback_audio(
+    audio: SharedAudio,
+    playback_generation: Arc<AtomicU64>,
+    request_id: u64,
+    operation: impl FnOnce(&mut dyn AudioBackend) -> Result<(), BackendError> + Send + 'static,
+) -> PlaybackRun {
+    match tokio::task::spawn_blocking(move || {
+        let mut audio = audio
+            .lock()
+            .map_err(|_| "audio engine lock was poisoned".to_owned())?;
+        if playback_generation.load(Ordering::Acquire) != request_id {
+            return Ok(None);
+        }
+        operation(audio.as_mut())
+            .map_err(|error| error.to_string())
+            .map(Some)
+    })
+    .await
+    {
+        Ok(Ok(Some(()))) => PlaybackRun::Completed(Ok(())),
+        Ok(Ok(None)) => PlaybackRun::Stale,
+        Ok(Err(error)) => PlaybackRun::Completed(Err(error)),
+        Err(error) => PlaybackRun::Completed(Err(format!("audio worker failed: {error}"))),
+    }
+}
+
 async fn finish_playback_error(state: &Mutex<AppSnapshot>, request_id: u64, error: String) {
     let mut snapshot = state.lock().await;
     if snapshot.playback.request_id == request_id {
@@ -763,11 +1017,13 @@ fn set_playback_error(snapshot: &mut AppSnapshot, error: String) {
 }
 
 async fn refresh_playback_telemetry(
-    state: &Arc<Mutex<AppSnapshot>>,
+    playback: &PlaybackCoordinator,
     catalog: &Arc<dyn MusicCatalog>,
     audio: &SharedAudio,
     storage: &SharedStorage,
 ) {
+    let state = &playback.state;
+    let playback_generation = &playback.generation;
     let telemetry = match audio.try_lock() {
         Ok(audio) => audio.telemetry(),
         Err(_) => return,
@@ -780,34 +1036,37 @@ async fn refresh_playback_telemetry(
         snapshot.playback.position_ms = telemetry.position_ms;
         snapshot.playback.duration_ms = telemetry.duration_ms.max(snapshot.playback.duration_ms);
         snapshot.playback.buffered_ms = telemetry.buffered_ms;
+        snapshot.playback.spectrum = telemetry.spectrum;
+        snapshot.playback.underrun_count = telemetry.underrun_count;
         if snapshot.playback.status == PlaybackStatus::Playing {
             let crossfade = Duration::from_secs(u64::from(snapshot.settings.crossfade_seconds));
             let lead_ms =
                 u64::try_from((crossfade + CROSSFADE_PREPARE_LEAD).as_millis()).unwrap_or(u64::MAX);
             let should_advance = telemetry.ended
-                || (crossfade > Duration::ZERO
+                || (snapshot.playback.repeat_mode != RepeatMode::One
+                    && crossfade > Duration::ZERO
                     && !snapshot.playback.queue.is_empty()
                     && telemetry.duration_ms > 0
                     && telemetry.position_ms.saturating_add(lead_ms) >= telemetry.duration_ms);
             if should_advance {
-                let Some(track) = snapshot.playback.queue.first().cloned() else {
+                let track = if telemetry.ended && snapshot.playback.repeat_mode == RepeatMode::One {
+                    snapshot.playback.current.clone()
+                } else {
+                    remember_current(&mut snapshot);
+                    refill_repeat_queue(&mut snapshot);
+                    take_queue_track(&mut snapshot, 0)
+                };
+                let Some(track) = track else {
                     snapshot.playback.status = PlaybackStatus::Ended;
+                    snapshot.playback.spectrum = [0; 24];
                     return;
                 };
-                snapshot.playback.queue.remove(0);
-                snapshot.playback.request_id = snapshot.playback.request_id.saturating_add(1);
-                let request_id = snapshot.playback.request_id;
-                snapshot.playback.current = Some(track.clone());
-                snapshot.playback.position_ms = 0;
-                snapshot.playback.duration_ms = track.duration_ms;
-                snapshot.playback.buffered_ms = 0;
-                snapshot.playback.error = None;
-                snapshot.playback.status = PlaybackStatus::Resolving;
+                let request_id = prepare_track(&mut snapshot, playback_generation, &track);
                 drop(snapshot);
                 spawn_playback(
                     track,
                     request_id,
-                    Arc::clone(state),
+                    playback.clone(),
                     Arc::clone(catalog),
                     Arc::clone(audio),
                     Arc::clone(storage),

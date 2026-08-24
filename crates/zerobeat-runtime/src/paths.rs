@@ -18,8 +18,12 @@ pub fn current_runtime_dir() -> PathBuf {
     runtime_dir(xdg.as_deref(), rustix::process::getuid().as_raw())
 }
 
-pub fn socket_path() -> PathBuf {
-    current_runtime_dir().join("daemon.sock")
+pub fn socket_path(protocol_version: u16) -> PathBuf {
+    socket_path_in(&current_runtime_dir(), protocol_version)
+}
+
+pub fn socket_path_in(runtime_directory: &Path, protocol_version: u16) -> PathBuf {
+    runtime_directory.join(format!("daemon-v{protocol_version}.sock"))
 }
 
 pub fn data_dir(

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use zerobeat_core::{NavigationState, Route, SessionMode, Track};
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
+pub const SPECTRUM_BAND_COUNT: usize = 24;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppSnapshot {
@@ -102,6 +103,13 @@ pub struct PlaybackSnapshot {
     pub error: Option<String>,
     pub request_id: u64,
     pub queue: Vec<Track>,
+    pub history: Vec<Track>,
+    pub shuffle: bool,
+    pub repeat_mode: RepeatMode,
+    pub muted: bool,
+    pub volume_before_mute: u8,
+    pub spectrum: [u8; SPECTRUM_BAND_COUNT],
+    pub underrun_count: u64,
 }
 
 impl Default for PlaybackSnapshot {
@@ -116,8 +124,23 @@ impl Default for PlaybackSnapshot {
             error: None,
             request_id: 0,
             queue: Vec::new(),
+            history: Vec::new(),
+            shuffle: false,
+            repeat_mode: RepeatMode::Off,
+            muted: false,
+            volume_before_mute: 100,
+            spectrum: [0; SPECTRUM_BAND_COUNT],
+            underrun_count: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,7 +173,15 @@ pub enum ClientCommand {
     ToggleLyrics,
     SetCrossfadeSeconds(u8),
     TogglePlayback,
+    PreviousTrack,
     NextTrack,
+    ToggleShuffle,
+    CycleRepeat,
+    ToggleMute,
+    SeekTo(u64),
+    PlayQueueIndex(usize),
+    RemoveQueueIndex(usize),
+    ClearQueue,
     SeekRelative(i64),
     SetVolume(u8),
     RequestSnapshot,

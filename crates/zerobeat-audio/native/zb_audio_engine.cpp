@@ -15,16 +15,31 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace {
+constexpr size_t ZB_SPECTRUM_BANDS = 24;
+constexpr size_t ZB_SPECTRUM_WINDOW_FRAMES = 2048;
+constexpr size_t ZB_SPECTRUM_MAX_FFT_FRAMES = 4096;
+constexpr size_t ZB_SPECTRUM_CAPTURE_FRAMES = 4096;
+constexpr size_t ZB_SPECTRUM_CAPTURE_BUFFERS = 3;
+constexpr uint8_t ZB_SPECTRUM_BUFFER_FREE = 0;
+constexpr uint8_t ZB_SPECTRUM_BUFFER_WRITING = 1;
+constexpr uint8_t ZB_SPECTRUM_BUFFER_READY = 2;
+constexpr uint8_t ZB_SPECTRUM_BUFFER_READING = 3;
+} // namespace
 
 struct zb_biquad_filter {
   double b0_1 = 1.0;
@@ -168,6 +183,20 @@ struct zb_engine {
   std::atomic<int32_t> filter_enabled{0};
   std::atomic<int32_t> filter_type{ZB_FILTER_NONE};
   std::atomic<float> filter_cutoff_hz{20000.0f};
+  std::array<std::atomic<uint8_t>, ZB_SPECTRUM_BANDS> spectrum{};
+  std::array<std::array<float, ZB_SPECTRUM_CAPTURE_FRAMES>,
+             ZB_SPECTRUM_CAPTURE_BUFFERS>
+      spectrum_buffers{};
+  std::array<std::atomic<uint8_t>, ZB_SPECTRUM_CAPTURE_BUFFERS>
+      spectrum_buffer_states{};
+  std::array<std::atomic<uint64_t>, ZB_SPECTRUM_CAPTURE_BUFFERS>
+      spectrum_buffer_generations{};
+  std::atomic<uint64_t> spectrum_generation{0};
+  std::atomic<uint64_t> spectrum_signal{0};
+  std::atomic<bool> spectrum_stop{false};
+  size_t spectrum_write_buffer = 0;
+  size_t spectrum_write_index = 0;
+  std::thread spectrum_thread;
   bool filter_was_enabled = false;
   int32_t filter_applied_type = ZB_FILTER_NONE;
   float filter_applied_cutoff_hz = 0.0f;
@@ -209,6 +238,216 @@ constexpr int64_t ZB_FFMPEG_MAX_ANALYZE_DURATION_US = 500 * 1000;
 constexpr int32_t ZB_FFMPEG_MAX_PROBE_PACKETS = 32;
 constexpr int64_t ZB_HTTP_RANGE_BYTES = 60 * 1024;
 constexpr double ZB_TAU = 6.28318530717958647692;
+
+int32_t analyze_spectrum_pcm(const float *samples, int64_t frame_count,
+                             int32_t channels, uint8_t *bands,
+                             int32_t band_count) {
+  if (samples == nullptr || bands == nullptr || frame_count <= 0 ||
+      channels <= 0 || band_count != static_cast<int32_t>(ZB_SPECTRUM_BANDS)) {
+    return ZB_ERR_INVALID_ARGUMENT;
+  }
+  auto frames =
+      std::min(static_cast<size_t>(frame_count), ZB_SPECTRUM_MAX_FFT_FRAMES);
+  frames = std::bit_floor(frames);
+  if (frames < 64) {
+    return ZB_ERR_INVALID_ARGUMENT;
+  }
+  const auto first_frame = static_cast<size_t>(frame_count) - frames;
+  std::array<std::complex<double>, ZB_SPECTRUM_MAX_FFT_FRAMES> spectrum{};
+  double window_sum = 0.0;
+  for (size_t frame = 0; frame < frames; ++frame) {
+    double mono = 0.0;
+    for (int32_t channel = 0; channel < channels; ++channel) {
+      mono += samples[((first_frame + frame) * static_cast<size_t>(channels)) +
+                      static_cast<size_t>(channel)];
+    }
+    mono /= channels;
+    const auto window =
+        0.5 - 0.5 * std::cos(ZB_TAU * frame / static_cast<double>(frames - 1));
+    spectrum[frame] = mono * window;
+    window_sum += window;
+  }
+  for (size_t index = 1, reversed = 0; index < frames; ++index) {
+    auto bit = frames >> 1;
+    for (; (reversed & bit) != 0; bit >>= 1) {
+      reversed ^= bit;
+    }
+    reversed ^= bit;
+    if (index < reversed) {
+      std::swap(spectrum[index], spectrum[reversed]);
+    }
+  }
+  for (size_t length = 2; length <= frames; length <<= 1) {
+    const auto angle = -ZB_TAU / static_cast<double>(length);
+    const std::complex<double> step(std::cos(angle), std::sin(angle));
+    for (size_t offset = 0; offset < frames; offset += length) {
+      std::complex<double> rotation(1.0, 0.0);
+      for (size_t index = 0; index < length / 2; ++index) {
+        const auto even = spectrum[offset + index];
+        const auto odd = spectrum[offset + index + length / 2] * rotation;
+        spectrum[offset + index] = even + odd;
+        spectrum[offset + index + length / 2] = even - odd;
+        rotation *= step;
+      }
+    }
+  }
+
+  const auto minimum_hz = std::log(60.0);
+  const auto frequency_span = std::log(16000.0) - minimum_hz;
+  const auto band_width =
+      frequency_span / static_cast<double>(ZB_SPECTRUM_BANDS - 1);
+  for (size_t band = 0; band < ZB_SPECTRUM_BANDS; ++band) {
+    const auto center = minimum_hz + band_width * static_cast<double>(band);
+    const auto low = std::max(minimum_hz, center - band_width * 0.5);
+    const auto high =
+        std::min(minimum_hz + frequency_span, center + band_width * 0.5);
+    const auto low_bin =
+        std::max<size_t>(1, static_cast<size_t>(std::floor(
+                                std::exp(low) * frames / ZB_SAMPLE_RATE)));
+    const auto high_bin = std::min<size_t>(
+        (frames / 2) - 1, static_cast<size_t>(std::ceil(
+                              std::exp(high) * frames / ZB_SAMPLE_RATE)));
+    double peak_magnitude = 0.0;
+    for (size_t bin = low_bin; bin <= high_bin; ++bin) {
+      peak_magnitude =
+          std::max(peak_magnitude, 2.0 * std::abs(spectrum[bin]) / window_sum);
+    }
+    const auto decibels = 20.0 * std::log10(std::max(peak_magnitude, 0.000001));
+    const auto normalized = std::clamp((decibels + 60.0) / 60.0, 0.0, 1.0);
+    bands[band] = static_cast<uint8_t>(std::lround(normalized * 100.0));
+  }
+  return ZB_OK;
+}
+
+void clear_spectrum_levels(zb_engine *engine) {
+  if (engine == nullptr) {
+    return;
+  }
+  for (auto &band : engine->spectrum) {
+    band.store(0, std::memory_order_relaxed);
+  }
+}
+
+void capture_spectrum(zb_engine *engine, const float *frames,
+                      ma_uint32 frame_count) {
+  if (engine == nullptr || frames == nullptr || frame_count == 0) {
+    return;
+  }
+  for (ma_uint32 frame = 0; frame < frame_count; ++frame) {
+    if (engine->spectrum_buffer_states[engine->spectrum_write_buffer].load(
+            std::memory_order_relaxed) != ZB_SPECTRUM_BUFFER_WRITING) {
+      bool acquired = false;
+      for (size_t candidate = 0; candidate < ZB_SPECTRUM_CAPTURE_BUFFERS;
+           ++candidate) {
+        uint8_t expected = ZB_SPECTRUM_BUFFER_FREE;
+        if (engine->spectrum_buffer_states[candidate].compare_exchange_strong(
+                expected, ZB_SPECTRUM_BUFFER_WRITING,
+                std::memory_order_acq_rel)) {
+          engine->spectrum_write_buffer = candidate;
+          engine->spectrum_write_index = 0;
+          acquired = true;
+          break;
+        }
+      }
+      if (!acquired) {
+        return;
+      }
+    }
+    const auto sample =
+        (frames[frame * ZB_CHANNELS] + frames[(frame * ZB_CHANNELS) + 1]) *
+        0.5f;
+    engine->spectrum_buffers[engine->spectrum_write_buffer]
+                            [engine->spectrum_write_index++] = sample;
+    if (engine->spectrum_write_index != ZB_SPECTRUM_CAPTURE_FRAMES) {
+      continue;
+    }
+
+    const auto completed = engine->spectrum_write_buffer;
+    engine->spectrum_buffer_generations[completed].store(
+        engine->spectrum_generation.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    engine->spectrum_buffer_states[completed].store(ZB_SPECTRUM_BUFFER_READY,
+                                                    std::memory_order_release);
+    engine->spectrum_signal.fetch_add(1, std::memory_order_release);
+    engine->spectrum_signal.notify_one();
+
+    bool found = false;
+    for (size_t candidate = 0; candidate < ZB_SPECTRUM_CAPTURE_BUFFERS;
+         ++candidate) {
+      uint8_t expected = ZB_SPECTRUM_BUFFER_FREE;
+      if (engine->spectrum_buffer_states[candidate].compare_exchange_strong(
+              expected, ZB_SPECTRUM_BUFFER_WRITING,
+              std::memory_order_acq_rel)) {
+        engine->spectrum_write_buffer = candidate;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      for (size_t candidate = 0; candidate < ZB_SPECTRUM_CAPTURE_BUFFERS;
+           ++candidate) {
+        uint8_t expected = ZB_SPECTRUM_BUFFER_READY;
+        if (engine->spectrum_buffer_states[candidate].compare_exchange_strong(
+                expected, ZB_SPECTRUM_BUFFER_WRITING,
+                std::memory_order_acq_rel)) {
+          engine->spectrum_write_buffer = candidate;
+          found = true;
+          break;
+        }
+      }
+    }
+    engine->spectrum_write_index = 0;
+    if (!found) {
+      return;
+    }
+  }
+}
+
+void analyze_spectrum_worker(zb_engine *engine) {
+  while (!engine->spectrum_stop.load(std::memory_order_acquire)) {
+    const auto signal = engine->spectrum_signal.load(std::memory_order_acquire);
+    bool analyzed = false;
+    for (size_t index = 0; index < ZB_SPECTRUM_CAPTURE_BUFFERS; ++index) {
+      uint8_t expected = ZB_SPECTRUM_BUFFER_READY;
+      if (!engine->spectrum_buffer_states[index].compare_exchange_strong(
+              expected, ZB_SPECTRUM_BUFFER_READING,
+              std::memory_order_acq_rel)) {
+        continue;
+      }
+      const auto generation = engine->spectrum_buffer_generations[index].load(
+          std::memory_order_relaxed);
+      std::array<uint8_t, ZB_SPECTRUM_BANDS> levels{};
+      const auto result = analyze_spectrum_pcm(
+          engine->spectrum_buffers[index].data(), ZB_SPECTRUM_CAPTURE_FRAMES, 1,
+          levels.data(), levels.size());
+      if (result == ZB_OK && generation == engine->spectrum_generation.load(
+                                               std::memory_order_acquire)) {
+        for (size_t band = 0; band < levels.size(); ++band) {
+          const auto previous = engine->spectrum[band].load();
+          const auto smoothed = static_cast<uint8_t>(
+              std::lround(previous * 0.55 + levels[band] * 0.45));
+          engine->spectrum[band].store(smoothed);
+        }
+        if (generation !=
+            engine->spectrum_generation.load(std::memory_order_acquire)) {
+          clear_spectrum_levels(engine);
+        }
+      }
+      engine->spectrum_buffer_states[index].store(ZB_SPECTRUM_BUFFER_FREE,
+                                                  std::memory_order_release);
+      analyzed = true;
+    }
+    if (!analyzed && !engine->spectrum_stop.load(std::memory_order_acquire)) {
+      engine->spectrum_signal.wait(signal, std::memory_order_acquire);
+    }
+  }
+}
+
+void reset_spectrum(zb_engine *engine) {
+  engine->spectrum_generation.fetch_add(1, std::memory_order_acq_rel);
+  clear_spectrum_levels(engine);
+  engine->spectrum_write_index = 0;
+}
 
 struct http_range_input {
   std::string url;
@@ -621,6 +860,7 @@ void reset_stream_locked(zb_engine *engine) {
   engine->filter_applied_type = ZB_FILTER_NONE;
   engine->filter_applied_cutoff_hz = 0.0f;
   engine->filter.reset();
+  reset_spectrum(engine);
   engine->source_uri.clear();
 }
 
@@ -1274,9 +1514,14 @@ void audio_output_callback(ma_device *device, void *output, const void *,
 
     cursor += rendered;
     engine->cursor_frames.store(cursor);
-    if (engine->decode_eof.load() &&
-        ma_pcm_rb_available_read(&engine->pcm_rb) == 0) {
+    const auto ended = engine->decode_eof.load() &&
+                       ma_pcm_rb_available_read(&engine->pcm_rb) == 0;
+    if (ended) {
       engine->state.store(ZB_STATE_ENDED);
+    }
+    capture_spectrum(engine, frames, frame_count);
+    if (ended) {
+      reset_spectrum(engine);
     }
     return;
   }
@@ -1301,6 +1546,10 @@ void audio_output_callback(ma_device *device, void *output, const void *,
     cursor += 1;
   }
   apply_filter_to_interleaved(engine, frames, frame_count);
+  capture_spectrum(engine, frames, frame_count);
+  if (engine->state.load() == ZB_STATE_ENDED) {
+    reset_spectrum(engine);
+  }
   engine->cursor_frames.store(cursor);
 }
 
@@ -1365,7 +1614,20 @@ int32_t open_decoded_source(zb_engine *engine, const char *source,
 }
 } // namespace
 
-zb_engine *zb_engine_create(void) { return new zb_engine(); }
+zb_engine *zb_engine_create(void) {
+  auto *engine = new zb_engine();
+  engine->spectrum_buffer_states[0].store(ZB_SPECTRUM_BUFFER_WRITING);
+  for (size_t index = 1; index < ZB_SPECTRUM_CAPTURE_BUFFERS; ++index) {
+    engine->spectrum_buffer_states[index].store(ZB_SPECTRUM_BUFFER_FREE);
+  }
+  try {
+    engine->spectrum_thread = std::thread(analyze_spectrum_worker, engine);
+  } catch (...) {
+    delete engine;
+    return nullptr;
+  }
+  return engine;
+}
 
 void zb_engine_destroy(zb_engine *engine) {
   if (engine == nullptr) {
@@ -1375,6 +1637,12 @@ void zb_engine_destroy(zb_engine *engine) {
     std::lock_guard<std::mutex> lock(engine->control_mutex);
     engine->state.store(ZB_STATE_RELEASED);
     reset_stream_locked(engine);
+  }
+  engine->spectrum_stop.store(true, std::memory_order_release);
+  engine->spectrum_signal.fetch_add(1, std::memory_order_release);
+  engine->spectrum_signal.notify_one();
+  if (engine->spectrum_thread.joinable()) {
+    engine->spectrum_thread.join();
   }
   delete engine;
 }
@@ -1481,6 +1749,7 @@ int32_t zb_engine_pause(zb_engine *engine) {
       ma_device_stop(&engine->device);
     }
     engine->state.store(ZB_STATE_PAUSED);
+    reset_spectrum(engine);
   }
   return ZB_OK;
 }
@@ -1642,6 +1911,28 @@ int64_t zb_engine_get_ffmpeg_max_analyze_duration_us(zb_engine *engine) {
 
 int64_t zb_engine_get_underrun_count(zb_engine *engine) {
   return engine == nullptr ? 0 : engine->underrun_count.load();
+}
+
+int32_t zb_engine_get_spectrum(zb_engine *engine, uint8_t *bands,
+                               int32_t band_count) {
+  if (engine == nullptr || bands == nullptr ||
+      band_count != static_cast<int32_t>(ZB_SPECTRUM_BANDS)) {
+    return ZB_ERR_INVALID_ARGUMENT;
+  }
+  for (size_t band = 0; band < ZB_SPECTRUM_BANDS; ++band) {
+    bands[band] = engine->spectrum[band].load();
+  }
+  return ZB_OK;
+}
+
+int32_t zb_engine_analyze_spectrum(const float *samples, int64_t sample_count,
+                                   int32_t channels, uint8_t *bands,
+                                   int32_t band_count) {
+  if (channels <= 0 || sample_count <= 0 || sample_count % channels != 0) {
+    return ZB_ERR_INVALID_ARGUMENT;
+  }
+  return analyze_spectrum_pcm(samples, sample_count / channels, channels, bands,
+                              band_count);
 }
 
 const char *zb_engine_get_last_error(zb_engine *engine) {

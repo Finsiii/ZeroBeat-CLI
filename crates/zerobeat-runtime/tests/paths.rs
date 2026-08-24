@@ -1,7 +1,9 @@
 use std::{ffi::OsStr, os::unix::fs::PermissionsExt};
 
 use tempfile::tempdir;
-use zerobeat_runtime::{data_dir, prepare_data_dir, prepare_runtime_dir, runtime_dir};
+use zerobeat_runtime::{
+    data_dir, prepare_data_dir, prepare_runtime_dir, runtime_dir, socket_path_in,
+};
 
 #[test]
 fn xdg_runtime_directory_is_namespaced() {
@@ -17,6 +19,17 @@ fn fallback_directory_is_unique_to_the_user() {
         runtime_dir(None, 1001),
         std::path::PathBuf::from("/tmp/zerobeat-1001")
     );
+}
+
+#[test]
+fn daemon_socket_is_namespaced_by_protocol_version() {
+    let runtime = std::path::Path::new("/run/user/1000/zerobeat");
+
+    assert_eq!(
+        socket_path_in(runtime, 9),
+        std::path::PathBuf::from("/run/user/1000/zerobeat/daemon-v9.sock")
+    );
+    assert_ne!(socket_path_in(runtime, 8), socket_path_in(runtime, 9));
 }
 
 #[test]

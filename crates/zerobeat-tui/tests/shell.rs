@@ -1,11 +1,11 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::TestBackend};
 use zerobeat_core::{Route, Track};
 use zerobeat_protocol::{
     AppSnapshot, ClientCommand, DownloadSnapshot, DownloadStatus, LyricsLineSnapshot, LyricsStatus,
     PlaybackSnapshot, PlaybackStatus, SearchSnapshot, SearchStatus,
 };
-use zerobeat_tui::{App, render};
+use zerobeat_tui::{App, MouseTarget, render};
 
 #[test]
 fn wide_layout_has_sidebar_home_content_and_persistent_player() {
@@ -52,7 +52,6 @@ fn navigation_and_search_keys_produce_daemon_commands() {
         app.handle_key(key(KeyCode::Char('2'))),
         Some(ClientCommand::Navigate(Route::Search))
     );
-    app.handle_key(key(KeyCode::Char('/')));
     assert_eq!(
         app.handle_key(key(KeyCode::Char('a'))),
         Some(ClientCommand::UpdateSearch("a".to_owned()))
@@ -118,6 +117,7 @@ fn player_bar_shows_current_track_and_transport_state() {
             error: None,
             request_id: 1,
             queue: Vec::new(),
+            ..PlaybackSnapshot::default()
         },
         ..AppSnapshot::default()
     };
@@ -126,8 +126,132 @@ fn player_bar_shows_current_track_and_transport_state() {
 
     assert!(screen.contains("Tampar"));
     assert!(screen.contains("Juicy Luicy"));
-    assert!(screen.contains("01:01 / 03:23"));
+    assert!(screen.contains("01:01"));
+    assert!(screen.contains("-02:22"));
+    assert!(screen.contains("SHUFFLE"));
+    assert!(screen.contains("REPEAT OFF"));
     assert!(screen.contains("75%"));
+}
+
+#[test]
+fn studio_deck_renders_real_spectrum_and_library_first_sidebar_without_capsules() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000));
+    snapshot.playback.duration_ms = 203_000;
+    snapshot.playback.spectrum = [
+        4, 8, 12, 24, 48, 72, 90, 64, 42, 30, 18, 12, 9, 7, 5, 4, 3, 2, 2, 1, 1, 0, 0, 0,
+    ];
+    snapshot.library.liked = vec![Track::new("liked", "Favorite", "Artist", 100_000)];
+    snapshot.library.recent = vec![Track::new("recent", "Recent", "Artist", 100_000)];
+
+    let (screen, hits) = render_screen_with_hits(140, 38, &App::new(snapshot));
+
+    for expected in [
+        "DISCOVER",
+        "YOUR MUSIC",
+        "Liked Songs",
+        "Recently Played",
+        "PLAYBACK",
+        "Queue",
+        "Lyrics",
+        "Native audio 48 kHz",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}");
+    }
+    assert!(screen.contains('█') || screen.contains('▆'));
+    assert!(!screen.contains("ONLINE"));
+    assert!(!screen.contains("[Online]"));
+    for target in [
+        MouseTarget::Progress,
+        MouseTarget::Shuffle,
+        MouseTarget::Previous,
+        MouseTarget::PlayPause,
+        MouseTarget::Next,
+        MouseTarget::Repeat,
+        MouseTarget::Like,
+        MouseTarget::Lyrics,
+        MouseTarget::Queue,
+        MouseTarget::Mute,
+    ] {
+        assert!(hits.region(target).is_some(), "missing {target:?}");
+    }
+}
+
+#[test]
+fn transport_shortcuts_cover_shuffle_repeat_previous_mute_and_queue_cleanup() {
+    let mut app = App::default();
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('s'))),
+        Some(ClientCommand::ToggleShuffle)
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('r'))),
+        Some(ClientCommand::CycleRepeat)
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('p'))),
+        Some(ClientCommand::PreviousTrack)
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('m'))),
+        Some(ClientCommand::ToggleMute)
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('x'))),
+        Some(ClientCommand::ClearQueue)
+    );
+}
+
+#[test]
+fn mouse_targets_navigate_seek_play_and_control_transport() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 200_000));
+    snapshot.playback.duration_ms = 200_000;
+    snapshot.playback.volume_percent = 75;
+    snapshot.navigation.open(Route::Search);
+    snapshot.search.status = SearchStatus::Ready;
+    snapshot.search.results = vec![Track::new("two", "Sialan", "Juicy Luicy", 242_000)];
+    let mut app = App::new(snapshot);
+    let (_, hits) = render_screen_with_hits(140, 38, &app);
+
+    let home = hits.region(MouseTarget::Navigation(Route::Home)).unwrap();
+    assert_eq!(
+        app.handle_mouse(click(home.x, home.y), &hits),
+        Some(ClientCommand::Navigate(Route::Home))
+    );
+
+    app.open(Route::Search);
+    let (_, hits) = render_screen_with_hits(140, 38, &app);
+    let track = hits.region(MouseTarget::ContentTrack(0)).unwrap();
+    assert_eq!(
+        app.handle_mouse(click(track.x, track.y), &hits),
+        Some(ClientCommand::PlayTrack(Track::new(
+            "two",
+            "Sialan",
+            "Juicy Luicy",
+            242_000
+        )))
+    );
+
+    let progress = hits.region(MouseTarget::Progress).unwrap();
+    assert_eq!(
+        app.handle_mouse(click(progress.right() - 1, progress.y), &hits),
+        Some(ClientCommand::SeekTo(200_000))
+    );
+
+    let shuffle = hits.region(MouseTarget::Shuffle).unwrap();
+    assert_eq!(
+        app.handle_mouse(click(shuffle.x, shuffle.y), &hits),
+        Some(ClientCommand::ToggleShuffle)
+    );
+    let player = hits.region(MouseTarget::Player).unwrap();
+    assert_eq!(
+        app.handle_mouse(scroll_up(player.x, player.y), &hits),
+        Some(ClientCommand::SetVolume(80))
+    );
 }
 
 #[test]
@@ -256,11 +380,18 @@ fn queue_is_visible_on_wide_layout_and_toggleable_as_a_focus_view() {
 }
 
 fn render_screen(width: u16, height: u16, app: &App) -> String {
+    render_screen_with_hits(width, height, app).0
+}
+
+fn render_screen_with_hits(width: u16, height: u16, app: &App) -> (String, zerobeat_tui::HitMap) {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
-    terminal.draw(|frame| render(frame, app)).expect("draw");
-
+    let mut hits = None;
     terminal
+        .draw(|frame| hits = Some(render(frame, app)))
+        .expect("draw");
+
+    let screen = terminal
         .backend()
         .buffer()
         .content
@@ -270,9 +401,28 @@ fn render_screen(width: u16, height: u16, app: &App) -> String {
         .chunks(width as usize)
         .map(|row| row.concat())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    (screen, hits.unwrap())
 }
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn click(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn scroll_up(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
 }

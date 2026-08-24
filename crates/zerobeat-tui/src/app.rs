@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use zerobeat_core::Route;
 use zerobeat_protocol::{
     AppSnapshot, ClientCommand, PlaybackSnapshot, PlaybackStatus, SearchSnapshot, SearchStatus,
@@ -13,6 +13,7 @@ pub struct App {
     library_selected: usize,
     downloads_selected: usize,
     queue_focused: bool,
+    queue_selected: usize,
 }
 
 impl App {
@@ -24,6 +25,9 @@ impl App {
     }
 
     pub fn replace_snapshot(&mut self, snapshot: AppSnapshot) {
+        self.queue_selected = self
+            .queue_selected
+            .min(snapshot.playback.queue.len().saturating_sub(1));
         self.snapshot = snapshot;
     }
 
@@ -61,6 +65,10 @@ impl App {
 
     pub fn queue_focused(&self) -> bool {
         self.queue_focused
+    }
+
+    pub fn queue_selected(&self) -> usize {
+        self.queue_selected
     }
 
     pub fn selected_index(&self) -> usize {
@@ -109,7 +117,10 @@ impl App {
                 Some(ClientCommand::Navigate(Route::Search))
             }
             KeyCode::Char('1') => self.navigate(Route::Home),
-            KeyCode::Char('2') => self.navigate(Route::Search),
+            KeyCode::Char('2') => {
+                self.search_focused = true;
+                self.navigate(Route::Search)
+            }
             KeyCode::Char('3') => self.navigate(Route::Library),
             KeyCode::Char('4') => self.navigate(Route::Downloads),
             KeyCode::Char('5') => self.navigate(Route::Settings),
@@ -120,6 +131,9 @@ impl App {
             KeyCode::Esc => {
                 self.snapshot.navigation.back();
                 Some(ClientCommand::Back)
+            }
+            KeyCode::Enter if self.queue_focused && !self.playback().queue.is_empty() => {
+                Some(ClientCommand::PlayQueueIndex(self.queue_selected))
             }
             KeyCode::Enter
                 if self.route() == Route::Search && !self.search().results.is_empty() =>
@@ -151,7 +165,15 @@ impl App {
                 ))
             }
             KeyCode::Char(' ') => Some(ClientCommand::TogglePlayback),
+            KeyCode::Char('p') => Some(ClientCommand::PreviousTrack),
             KeyCode::Char('n') => Some(ClientCommand::NextTrack),
+            KeyCode::Char('s') => Some(ClientCommand::ToggleShuffle),
+            KeyCode::Char('r') => Some(ClientCommand::CycleRepeat),
+            KeyCode::Char('m') => Some(ClientCommand::ToggleMute),
+            KeyCode::Char('x') => Some(ClientCommand::ClearQueue),
+            KeyCode::Delete if self.queue_focused && !self.playback().queue.is_empty() => {
+                Some(ClientCommand::RemoveQueueIndex(self.queue_selected))
+            }
             KeyCode::Left => Some(ClientCommand::SeekRelative(-10_000)),
             KeyCode::Right => Some(ClientCommand::SeekRelative(10_000)),
             KeyCode::Char('-') => Some(ClientCommand::SetVolume(
@@ -160,9 +182,88 @@ impl App {
             KeyCode::Char('+') | KeyCode::Char('=') => Some(ClientCommand::SetVolume(
                 self.playback().volume_percent.saturating_add(5).min(100),
             )),
+            KeyCode::Down | KeyCode::Char('j') if self.queue_focused => {
+                self.move_queue_selection(true);
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.queue_focused => {
+                self.move_queue_selection(false);
+                None
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
             _ => None,
+        }
+    }
+
+    pub fn handle_mouse(
+        &mut self,
+        event: MouseEvent,
+        hits: &crate::HitMap,
+    ) -> Option<ClientCommand> {
+        if matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && hits.contains(crate::MouseTarget::Player, event.column, event.row)
+        {
+            let volume = if event.kind == MouseEventKind::ScrollUp {
+                self.playback().volume_percent.saturating_add(5).min(100)
+            } else {
+                self.playback().volume_percent.saturating_sub(5)
+            };
+            return Some(ClientCommand::SetVolume(volume));
+        }
+        if event.kind != MouseEventKind::Down(MouseButton::Left) {
+            return None;
+        }
+        let target = hits.target_at(event.column, event.row)?;
+        match target {
+            crate::MouseTarget::Navigation(Route::Search) => {
+                self.search_focused = true;
+                self.navigate(Route::Search)
+            }
+            crate::MouseTarget::Navigation(route) => self.navigate(route),
+            crate::MouseTarget::SearchInput => {
+                self.open(Route::Search);
+                self.search_focused = true;
+                Some(ClientCommand::Navigate(Route::Search))
+            }
+            crate::MouseTarget::ContentTrack(index) => {
+                self.select_index(index);
+                self.track_at(index).map(ClientCommand::PlayTrack)
+            }
+            crate::MouseTarget::QueueTrack(index) => {
+                self.queue_selected = index;
+                Some(ClientCommand::PlayQueueIndex(index))
+            }
+            crate::MouseTarget::Progress => {
+                let area = hits.region(crate::MouseTarget::Progress)?;
+                let denominator = area.width.saturating_sub(1).max(1);
+                let offset = event.column.saturating_sub(area.x).min(denominator);
+                let position = self
+                    .playback()
+                    .duration_ms
+                    .saturating_mul(u64::from(offset))
+                    / u64::from(denominator);
+                Some(ClientCommand::SeekTo(position))
+            }
+            crate::MouseTarget::Shuffle => Some(ClientCommand::ToggleShuffle),
+            crate::MouseTarget::Previous => Some(ClientCommand::PreviousTrack),
+            crate::MouseTarget::PlayPause => Some(ClientCommand::TogglePlayback),
+            crate::MouseTarget::Next => Some(ClientCommand::NextTrack),
+            crate::MouseTarget::Repeat => Some(ClientCommand::CycleRepeat),
+            crate::MouseTarget::Like => self
+                .playback()
+                .current
+                .clone()
+                .map(ClientCommand::ToggleLike),
+            crate::MouseTarget::Lyrics => Some(ClientCommand::ToggleLyrics),
+            crate::MouseTarget::Mute => Some(ClientCommand::ToggleMute),
+            crate::MouseTarget::Queue => {
+                self.queue_focused = !self.queue_focused;
+                None
+            }
+            crate::MouseTarget::Player => None,
         }
     }
 
@@ -183,6 +284,30 @@ impl App {
             Route::Settings => None,
         };
         selected.or_else(|| self.playback().current.clone())
+    }
+
+    fn track_at(&self, index: usize) -> Option<zerobeat_core::Track> {
+        match self.route() {
+            Route::Home => self.library().recent.get(index).cloned(),
+            Route::Search => self.search().results.get(index).cloned(),
+            Route::Library => self.library_tracks().get(index).cloned(),
+            Route::Downloads => self
+                .library()
+                .downloads
+                .get(index)
+                .map(|download| download.track.clone()),
+            Route::Settings => None,
+        }
+    }
+
+    fn select_index(&mut self, index: usize) {
+        match self.route() {
+            Route::Home => self.home_selected = index,
+            Route::Search => self.snapshot.search.selected_index = index,
+            Route::Library => self.library_selected = index,
+            Route::Downloads => self.downloads_selected = index,
+            Route::Settings => {}
+        }
     }
 
     fn library_tracks(&self) -> Vec<zerobeat_core::Track> {
@@ -224,6 +349,17 @@ impl App {
             selected.checked_sub(1).unwrap_or(length - 1)
         };
         None
+    }
+
+    fn move_queue_selection(&mut self, next: bool) {
+        let length = self.playback().queue.len();
+        if length == 0 {
+            self.queue_selected = 0;
+        } else if next {
+            self.queue_selected = (self.queue_selected + 1) % length;
+        } else {
+            self.queue_selected = self.queue_selected.checked_sub(1).unwrap_or(length - 1);
+        }
     }
 
     fn navigate(&mut self, route: Route) -> Option<ClientCommand> {
