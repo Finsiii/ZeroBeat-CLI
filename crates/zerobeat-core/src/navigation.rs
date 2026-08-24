@@ -8,6 +8,7 @@ pub enum Route {
     Library,
     Downloads,
     Settings,
+    RecentlyPlayed,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

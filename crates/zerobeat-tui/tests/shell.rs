@@ -22,9 +22,40 @@ fn wide_layout_has_sidebar_home_content_and_persistent_player() {
 fn compact_layout_uses_top_navigation_without_losing_player() {
     let screen = render_screen(72, 24, &App::default());
 
-    assert!(screen.contains("Home  Search  Library"));
+    assert!(screen.contains("4 Home"));
+    assert!(screen.contains("5 Search"));
     assert!(screen.contains("Guest · Local"));
     assert!(screen.contains("Nothing playing"));
+}
+
+#[test]
+fn compact_layout_exposes_all_numbered_actions_and_hit_targets() {
+    let (screen, hits) = render_screen_with_hits(72, 24, &App::default());
+
+    for expected in [
+        "1 Library",
+        "2 Recent",
+        "3 Downloads",
+        "4 Home",
+        "5 Search",
+        "6 Queue",
+        "7 Lyrics",
+        "8 Settings",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}");
+    }
+    for target in [
+        MouseTarget::Navigation(Route::Library),
+        MouseTarget::Navigation(Route::RecentlyPlayed),
+        MouseTarget::Navigation(Route::Downloads),
+        MouseTarget::Navigation(Route::Home),
+        MouseTarget::Navigation(Route::Search),
+        MouseTarget::Queue,
+        MouseTarget::Lyrics,
+        MouseTarget::Navigation(Route::Settings),
+    ] {
+        assert!(hits.region(target).is_some(), "missing {target:?}");
+    }
 }
 
 #[test]
@@ -259,6 +290,93 @@ fn sidebar_numbers_match_keyboard_navigation_and_sections_are_dividers() {
 }
 
 #[test]
+fn recent_played_shortcut_and_home_shortcut_are_distinct() {
+    let mut app = App::default();
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('2'))),
+        Some(ClientCommand::Navigate(Route::RecentlyPlayed))
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('4'))),
+        Some(ClientCommand::Navigate(Route::Home))
+    );
+}
+
+#[test]
+fn recently_played_route_renders_and_plays_recent_track() {
+    let recent = Track::new("recent", "Recently Played", "ZeroBeat", 190_000);
+    let mut snapshot = AppSnapshot::default();
+    snapshot.navigation.open(Route::RecentlyPlayed);
+    snapshot.library.recent = vec![recent.clone()];
+    let mut app = App::new(snapshot);
+
+    let screen = render_screen(110, 32, &app);
+    assert!(screen.contains("Recently played"));
+    assert!(screen.contains("Recently Played"));
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(ClientCommand::PlayTrack(recent))
+    );
+}
+
+#[test]
+fn overlay_controls_do_not_look_like_active_navigation() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.lyrics.visible = true;
+    let screen = render_screen(140, 38, &App::new(snapshot));
+
+    let queue_line = screen
+        .lines()
+        .find(|line| line.contains("6  Queue"))
+        .expect("queue sidebar item");
+    let lyrics_line = screen
+        .lines()
+        .find(|line| line.contains("7  Lyrics"))
+        .expect("lyrics sidebar item");
+    assert!(!queue_line.trim_start().starts_with('│'));
+    assert!(!lyrics_line.trim_start().starts_with('│'));
+}
+
+#[test]
+fn spectrum_deck_uses_multiple_visual_rows() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000));
+    snapshot.playback.spectrum = [
+        4, 8, 12, 24, 48, 72, 90, 64, 42, 30, 18, 12, 9, 7, 5, 4, 3, 2, 2, 1, 1, 0, 0, 0,
+    ];
+
+    let screen = render_screen(140, 38, &App::new(snapshot));
+    let visual_rows = screen
+        .lines()
+        .filter(|line| line.contains('█') || line.contains('▇') || line.contains('▆'))
+        .count();
+    assert!(
+        visual_rows >= 3,
+        "expected multi-row visualizer, got {visual_rows}"
+    );
+}
+
+#[test]
+fn spectrum_visualizer_is_dense_between_native_peaks() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000));
+    snapshot.playback.spectrum = [100; 24];
+
+    let screen = render_screen(140, 38, &App::new(snapshot));
+    let active = |character: char| matches!(character, '▂' | '▄' | '▅' | '▆' | '▇' | '█');
+    let dense_row = screen.lines().any(|line| {
+        let characters = line.chars().collect::<Vec<_>>();
+        characters
+            .windows(2)
+            .any(|pair| active(pair[0]) && active(pair[1]))
+    });
+    assert!(dense_row, "visualizer should not alternate blank columns");
+}
+
+#[test]
 fn paused_visualizer_is_a_continuous_line_instead_of_dotted_blocks() {
     let mut snapshot = AppSnapshot::default();
     snapshot.playback.status = PlaybackStatus::Paused;
@@ -344,6 +462,16 @@ fn mouse_targets_navigate_seek_play_and_control_transport() {
     assert_eq!(
         app.handle_mouse(click(home.x, home.y), &hits),
         Some(ClientCommand::Navigate(Route::Home))
+    );
+
+    app.open(Route::Home);
+    let (_, hits) = render_screen_with_hits(140, 38, &app);
+    let recent = hits
+        .region(MouseTarget::Navigation(Route::RecentlyPlayed))
+        .unwrap();
+    assert_eq!(
+        app.handle_mouse(click(recent.x, recent.y), &hits),
+        Some(ClientCommand::Navigate(Route::RecentlyPlayed))
     );
 
     app.open(Route::Search);

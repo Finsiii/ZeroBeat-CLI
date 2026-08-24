@@ -53,3 +53,12 @@ fn back_returns_to_the_previous_distinct_route() {
 
     assert_eq!(navigation.active_route(), Route::Search);
 }
+
+#[test]
+fn recently_played_is_a_distinct_route() {
+    let mut navigation = NavigationState::default();
+
+    navigation.open(Route::RecentlyPlayed);
+
+    assert_eq!(navigation.active_route(), Route::RecentlyPlayed);
+}

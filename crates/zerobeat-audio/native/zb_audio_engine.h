@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 typedef struct zb_engine zb_engine;
+typedef struct zb_decode_cancel zb_decode_cancel;
 
 typedef enum zb_engine_state {
   ZB_STATE_IDLE = 0,
@@ -28,6 +29,10 @@ typedef enum zb_engine_filter_type {
 
 zb_engine *zb_engine_create(void);
 void zb_engine_destroy(zb_engine *engine);
+zb_decode_cancel *zb_engine_get_decode_cancel(zb_engine *engine);
+void zb_decode_cancel_retain(zb_decode_cancel *cancel);
+void zb_decode_cancel_release(zb_decode_cancel *cancel);
+void zb_decode_cancel_request(zb_decode_cancel *cancel);
 
 int32_t zb_engine_open_file(zb_engine *engine, const char *path);
 int32_t zb_engine_open_url(zb_engine *engine, const char *url);

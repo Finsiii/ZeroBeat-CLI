@@ -30,6 +30,10 @@ fn daemon_socket_is_namespaced_by_protocol_version() {
         std::path::PathBuf::from("/run/user/1000/zerobeat/daemon-v9.sock")
     );
     assert_ne!(socket_path_in(runtime, 8), socket_path_in(runtime, 9));
+    assert_eq!(
+        socket_path_in(runtime, 11),
+        std::path::PathBuf::from("/run/user/1000/zerobeat/daemon-v11.sock")
+    );
 }
 
 #[test]

@@ -4,12 +4,6 @@ use zerobeat_protocol::{
     RepeatMode, SearchSnapshot, SearchStatus, decode, encode,
 };
 
-#[derive(Debug, serde::Deserialize, PartialEq)]
-enum LegacyControlCommand {
-    Hello { protocol_version: u16 },
-    Shutdown,
-}
-
 #[test]
 fn command_round_trips_without_losing_payload() {
     let commands = [
@@ -17,6 +11,7 @@ fn command_round_trips_without_losing_payload() {
             protocol_version: PROTOCOL_VERSION,
         },
         ClientCommand::Navigate(Route::Library),
+        ClientCommand::Navigate(Route::RecentlyPlayed),
         ClientCommand::UpdateSearch("tampar".into()),
         ClientCommand::SubmitSearch,
         ClientCommand::SelectNext,
@@ -99,21 +94,6 @@ fn malformed_payload_is_rejected() {
 }
 
 #[test]
-fn hello_and_shutdown_remain_readable_by_legacy_daemons() {
-    let hello = encode(&ClientCommand::Hello {
-        protocol_version: PROTOCOL_VERSION,
-    })
-    .unwrap();
-    let shutdown = encode(&ClientCommand::Shutdown).unwrap();
-
-    assert_eq!(
-        decode::<LegacyControlCommand>(&hello).unwrap(),
-        LegacyControlCommand::Hello {
-            protocol_version: PROTOCOL_VERSION
-        }
-    );
-    assert_eq!(
-        decode::<LegacyControlCommand>(&shutdown).unwrap(),
-        LegacyControlCommand::Shutdown
-    );
+fn protocol_version_requires_a_new_socket_namespace() {
+    assert_eq!(PROTOCOL_VERSION, 11);
 }

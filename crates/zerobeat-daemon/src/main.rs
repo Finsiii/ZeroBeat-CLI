@@ -25,9 +25,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let audio = DualDeck::new(NativeEngine::new()?, NativeEngine::new()?);
     let database = Database::open(data_directory.join("guest.db"))?;
-    DaemonServer::bind_with_services_and_storage(
+    let catalog = ApiCatalog::new(config);
+    DaemonServer::bind_with_services_and_storage_and_queue(
         socket,
-        ApiCatalog::new(config),
+        catalog.clone(),
+        catalog,
         audio,
         database,
         data_directory.join("downloads"),

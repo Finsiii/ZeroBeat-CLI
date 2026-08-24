@@ -76,18 +76,20 @@ impl<B: AudioBackend> Player<B> {
     }
 
     pub fn skip_to_next(&mut self) -> Result<(), PlayerError> {
-        if self.current.take().is_some() {
+        if self.current.is_some() {
             self.backend.stop()?;
         }
         self.start_next()
     }
 
     fn start_next(&mut self) -> Result<(), PlayerError> {
-        let Some(item) = self.queue.pop_front() else {
+        let Some(item) = self.queue.front().cloned() else {
+            self.current = None;
             self.state = PlayerState::Ended;
             return Ok(());
         };
         self.backend.load(&item.source)?;
+        self.queue.pop_front();
         self.current = Some(item);
         self.state = PlayerState::Buffering;
         Ok(())

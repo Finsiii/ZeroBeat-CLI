@@ -23,6 +23,7 @@ pub fn render_content(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMa
         Route::Home => render_home(frame, area, app, hits),
         Route::Search => render_search(frame, area, app, hits),
         Route::Library => render_library(frame, area, app, hits),
+        Route::RecentlyPlayed => render_recently_played(frame, area, app, hits),
         Route::Downloads => render_downloads(frame, area, app, hits),
         Route::Settings => render_settings(frame, area, app),
     }
@@ -271,6 +272,36 @@ fn render_library(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     ));
     frame.render_widget(
         Paragraph::new(lines).block(card().title(" Your local library ")),
+        area.inner(ratatui::layout::Margin::new(2, 2)),
+    );
+}
+
+fn render_recently_played(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
+    let mut lines = vec![section_title("Recently played")];
+    if app.library().recent.is_empty() {
+        lines.push(empty_line("Your listening history will appear here"));
+    } else {
+        for (index, track) in app.library().recent.iter().enumerate() {
+            let row = lines.len() as u16;
+            hits.add(
+                MouseTarget::ContentTrack(index),
+                Rect::new(
+                    area.x.saturating_add(4),
+                    area.y.saturating_add(3 + row),
+                    area.width.saturating_sub(8),
+                    1,
+                ),
+            );
+            lines.push(track_line(track, index == app.selected_index()));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(empty_line("↑/↓ select · Enter play · a add to queue"));
+    frame.render_widget(
+        Paragraph::new(lines).block(card().title(format!(
+            " Recently played · {} ",
+            app.library().recent.len()
+        ))),
         area.inner(ratatui::layout::Margin::new(2, 2)),
     );
 }

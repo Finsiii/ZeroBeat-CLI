@@ -1,8 +1,13 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+#[cfg(target_os = "linux")]
+use crate::NativeCancellationHandle;
 use crate::{BackendError, StreamSource};
 
 pub const SPECTRUM_BAND_COUNT: usize = 24;
+
+#[cfg(target_os = "linux")]
+pub type CancellationController = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackendTelemetry {
@@ -34,10 +39,10 @@ pub trait AudioBackend: Send {
         _duration: Duration,
         should_continue: &dyn Fn() -> bool,
     ) -> Result<(), BackendError> {
-        self.stop()?;
         if !should_continue() {
             return Ok(());
         }
+        self.stop()?;
         self.load(source)?;
         if !should_continue() {
             return self.stop();
@@ -61,5 +66,23 @@ pub trait AudioBackend: Send {
 
     fn telemetry(&self) -> BackendTelemetry {
         BackendTelemetry::default()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancellation_handle(&self) -> Option<NativeCancellationHandle> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancel_current_load(&self) {
+        if let Some(handle) = self.cancellation_handle() {
+            handle.cancel();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancellation_controller(&self) -> Option<CancellationController> {
+        self.cancellation_handle()
+            .map(|handle| Arc::new(move || handle.cancel()) as CancellationController)
     }
 }

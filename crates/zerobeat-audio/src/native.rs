@@ -3,7 +3,10 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::{AudioBackend, BackendError, BackendTelemetry, SPECTRUM_BAND_COUNT, StreamSource};
+use crate::{
+    AudioBackend, BackendError, BackendTelemetry, CancellationController, SPECTRUM_BAND_COUNT,
+    StreamSource,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeState {
@@ -18,6 +21,37 @@ pub enum NativeState {
     Released,
 }
 
+pub struct NativeCancellationHandle {
+    raw: NonNull<ZbDecodeCancel>,
+}
+
+impl NativeCancellationHandle {
+    pub fn cancel(&self) {
+        unsafe { zb_decode_cancel_request(self.raw.as_ptr()) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Clone for NativeCancellationHandle {
+    fn clone(&self) -> Self {
+        unsafe { zb_decode_cancel_retain(self.raw.as_ptr()) };
+        Self { raw: self.raw }
+    }
+}
+
+impl Drop for NativeCancellationHandle {
+    fn drop(&mut self) {
+        unsafe { zb_decode_cancel_release(self.raw.as_ptr()) };
+    }
+}
+
+unsafe impl Send for NativeCancellationHandle {}
+unsafe impl Sync for NativeCancellationHandle {}
+
 pub struct NativeEngine {
     raw: NonNull<ZbEngine>,
 }
@@ -27,6 +61,11 @@ impl NativeEngine {
         NonNull::new(unsafe { zb_engine_create() })
             .map(|raw| Self { raw })
             .ok_or_else(|| BackendError::Unavailable("native engine allocation failed".into()))
+    }
+
+    pub fn cancellation_handle(&self) -> Option<NativeCancellationHandle> {
+        NonNull::new(unsafe { zb_engine_get_decode_cancel(self.raw.as_ptr()) })
+            .map(|raw| NativeCancellationHandle { raw })
     }
 
     pub fn state(&self) -> NativeState {
@@ -200,6 +239,15 @@ impl AudioBackend for NativeEngine {
             ended: self.state() == NativeState::Ended,
         }
     }
+
+    fn cancellation_handle(&self) -> Option<NativeCancellationHandle> {
+        NativeEngine::cancellation_handle(self)
+    }
+
+    fn cancellation_controller(&self) -> Option<CancellationController> {
+        self.cancellation_handle()
+            .map(|handle| std::sync::Arc::new(move || handle.cancel()) as CancellationController)
+    }
 }
 
 impl Drop for NativeEngine {
@@ -219,9 +267,18 @@ struct ZbEngine {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct ZbDecodeCancel {
+    _private: [u8; 0],
+}
+
 unsafe extern "C" {
     fn zb_engine_create() -> *mut ZbEngine;
     fn zb_engine_destroy(engine: *mut ZbEngine);
+    fn zb_engine_get_decode_cancel(engine: *mut ZbEngine) -> *mut ZbDecodeCancel;
+    fn zb_decode_cancel_retain(cancel: *mut ZbDecodeCancel);
+    fn zb_decode_cancel_release(cancel: *mut ZbDecodeCancel);
+    fn zb_decode_cancel_request(cancel: *mut ZbDecodeCancel);
     fn zb_engine_prebuffer_file(engine: *mut ZbEngine, path: *const c_char) -> c_int;
     fn zb_engine_prebuffer_url(engine: *mut ZbEngine, url: *const c_char) -> c_int;
     fn zb_engine_play(engine: *mut ZbEngine) -> c_int;

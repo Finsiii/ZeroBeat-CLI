@@ -12,6 +12,7 @@ pub struct App {
     should_quit: bool,
     home_selected: usize,
     library_selected: usize,
+    recent_selected: usize,
     downloads_selected: usize,
     queue_focused: bool,
     queue_selected: usize,
@@ -96,6 +97,7 @@ impl App {
             Route::Home => self.home_selected,
             Route::Search => self.search().selected_index,
             Route::Library => self.library_selected,
+            Route::RecentlyPlayed => self.recent_selected,
             Route::Downloads => self.downloads_selected,
             Route::Settings => 0,
         }
@@ -136,7 +138,7 @@ impl App {
         match event.code {
             KeyCode::Char('/') => self.navigate_search(),
             KeyCode::Char('1') => self.navigate(Route::Library),
-            KeyCode::Char('2') => self.navigate(Route::Home),
+            KeyCode::Char('2') => self.navigate(Route::RecentlyPlayed),
             KeyCode::Char('3') => self.navigate(Route::Downloads),
             KeyCode::Char('4') => self.navigate(Route::Home),
             KeyCode::Char('5') => self.navigate_search(),
@@ -289,6 +291,7 @@ impl App {
                 .get(self.search().selected_index)
                 .cloned(),
             Route::Library => self.library_tracks().get(self.library_selected).cloned(),
+            Route::RecentlyPlayed => self.library().recent.get(self.recent_selected).cloned(),
             Route::Downloads => self
                 .library()
                 .downloads
@@ -304,6 +307,7 @@ impl App {
             Route::Home => self.library().recent.get(index).cloned(),
             Route::Search => self.search().results.get(index).cloned(),
             Route::Library => self.library_tracks().get(index).cloned(),
+            Route::RecentlyPlayed => self.library().recent.get(index).cloned(),
             Route::Downloads => self
                 .library()
                 .downloads
@@ -318,6 +322,7 @@ impl App {
             Route::Home => self.home_selected = index,
             Route::Search => self.snapshot.search.selected_index = index,
             Route::Library => self.library_selected = index,
+            Route::RecentlyPlayed => self.recent_selected = index,
             Route::Downloads => self.downloads_selected = index,
             Route::Settings => {}
         }
@@ -344,6 +349,7 @@ impl App {
         let length = match self.route() {
             Route::Home => self.library().recent.len(),
             Route::Library => self.library_tracks().len(),
+            Route::RecentlyPlayed => self.library().recent.len(),
             Route::Downloads => self.library().downloads.len(),
             Route::Search | Route::Settings => 0,
         };
@@ -353,6 +359,7 @@ impl App {
         let selected = match self.route() {
             Route::Home => &mut self.home_selected,
             Route::Library => &mut self.library_selected,
+            Route::RecentlyPlayed => &mut self.recent_selected,
             Route::Downloads => &mut self.downloads_selected,
             Route::Search | Route::Settings => return None,
         };

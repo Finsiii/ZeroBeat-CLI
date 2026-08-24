@@ -27,7 +27,7 @@ pub fn render_player(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -79,14 +79,16 @@ pub fn render_player(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap
             ),
         ]),
     );
-    centered(
-        frame,
-        rows[2],
-        Line::styled(
-            spectrum_text(app.spectrum(), rows[2].width),
-            Style::default().fg(theme::ACCENT),
-        ),
-    );
+    for (index, line) in spectrum_rows(app.spectrum(), rows[2].width)
+        .into_iter()
+        .enumerate()
+    {
+        centered(
+            frame,
+            Rect::new(rows[2].x, rows[2].y + index as u16, rows[2].width, 1),
+            Line::styled(line, Style::default().fg(theme::ACCENT)),
+        );
+    }
     render_progress(frame, rows[3], app, hits);
     render_controls(frame, rows[4], app, hits);
     centered(
@@ -165,10 +167,14 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
     let controls = [
         (
             MouseTarget::Shuffle,
-            if wide { "(s) Shuffle" } else { "(s) Shuf" }.to_owned(),
+            if wide { "(s) Shuffle" } else { "(s)" }.to_owned(),
             app.playback().shuffle,
         ),
-        (MouseTarget::Previous, "(p) Prev".to_owned(), false),
+        (
+            MouseTarget::Previous,
+            if wide { "(p) Prev" } else { "(p)" }.to_owned(),
+            false,
+        ),
         (
             MouseTarget::PlayPause,
             if wide {
@@ -177,42 +183,55 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
                 } else {
                     "(Space) Play"
                 }
-            } else if playing {
-                "(Space) Ⅱ"
             } else {
-                "(Space) ▶"
+                "(␠)"
             }
             .to_owned(),
             true,
         ),
-        (MouseTarget::Next, "(n) Next".to_owned(), false),
+        (
+            MouseTarget::Next,
+            if wide { "(n) Next" } else { "(n)" }.to_owned(),
+            false,
+        ),
         (
             MouseTarget::Repeat,
             if wide {
                 format!("(r) {repeat}")
             } else {
-                format!("(r) {}", repeat.trim_start_matches("Repeat "))
+                "(r)".to_owned()
             },
             app.playback().repeat_mode != RepeatMode::Off,
         ),
         (
             MouseTarget::Like,
-            if liked { "(l) ♥" } else { "(l) ♡" }.to_owned(),
+            if wide {
+                if liked { "(l) ♥" } else { "(l) ♡" }
+            } else {
+                "(l)"
+            }
+            .to_owned(),
             liked,
         ),
         (
             MouseTarget::Lyrics,
-            if wide { "(y) Lyrics" } else { "(y) Lyr" }.to_owned(),
+            if wide { "(y) Lyrics" } else { "(y)" }.to_owned(),
             app.lyrics().visible,
         ),
         (
             MouseTarget::Queue,
-            if wide { "(u) Queue" } else { "(u) Q" }.to_owned(),
+            if wide { "(u) Queue" } else { "(u)" }.to_owned(),
             app.queue_focused(),
         ),
         (
             MouseTarget::Mute,
-            format!("(m) {volume}"),
+            if wide {
+                format!("(m) {volume}")
+            } else if app.playback().muted {
+                "(m)".to_owned()
+            } else {
+                format!("(m){}", app.playback().volume_percent)
+            },
             app.playback().muted,
         ),
     ];
@@ -268,24 +287,43 @@ fn centered(frame: &mut Frame, area: Rect, line: Line<'_>) {
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
-fn spectrum_text(spectrum: &[u8; 24], available_width: u16) -> String {
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let width = usize::from(available_width.saturating_sub(8).clamp(32, 72));
+fn spectrum_rows(spectrum: &[u8; 24], available_width: u16) -> Vec<String> {
+    const ROWS: usize = 5;
+    const PARTIAL: [char; 4] = [' ', '▂', '▄', '▆'];
+    let width = usize::from(available_width.saturating_sub(8).clamp(16, 88));
     if spectrum.iter().all(|value| *value == 0) {
-        return "─".repeat(width);
+        let mut rows = vec![String::new(); ROWS];
+        rows[ROWS - 1] = "─".repeat(width);
+        return rows;
     }
-    let last = spectrum.len() - 1;
-    (0..width)
-        .map(|index| {
-            let scaled = index * last;
-            let left = scaled / width.saturating_sub(1);
-            let right = (left + 1).min(last);
-            let fraction = scaled % width.saturating_sub(1);
-            let left_value = usize::from(spectrum[left].min(100));
-            let right_value = usize::from(spectrum[right].min(100));
-            let value = (left_value * (width - 1 - fraction) + right_value * fraction)
-                / width.saturating_sub(1);
-            LEVELS[value * (LEVELS.len() - 1) / 100]
+
+    let values = (0..width)
+        .map(|column| {
+            let scaled = column * (spectrum.len() - 1);
+            let left = scaled / width.saturating_sub(1).max(1);
+            let right = (left + 1).min(spectrum.len() - 1);
+            let remainder = scaled % width.saturating_sub(1).max(1);
+            let span = width.saturating_sub(1).max(1);
+            (usize::from(spectrum[left]) * (span - remainder)
+                + usize::from(spectrum[right]) * remainder)
+                / span
+        })
+        .collect::<Vec<_>>();
+
+    (0..ROWS)
+        .map(|row| {
+            values
+                .iter()
+                .map(|value| {
+                    let units = value.saturating_mul(ROWS * 4) / 100;
+                    let threshold = (ROWS - row - 1) * 4;
+                    if units >= threshold + 4 {
+                        '█'
+                    } else {
+                        PARTIAL[units.saturating_sub(threshold).min(PARTIAL.len() - 1)]
+                    }
+                })
+                .collect()
         })
         .collect()
 }
@@ -293,4 +331,19 @@ fn spectrum_text(spectrum: &[u8; 24], available_width: u16) -> String {
 fn clock(milliseconds: u64) -> String {
     let seconds = milliseconds / 1_000;
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spectrum_rows;
+
+    #[test]
+    fn resampling_preserves_distinct_native_peak_locations() {
+        let mut low = [0; 24];
+        low[2] = 100;
+        let mut high = [0; 24];
+        high[21] = 100;
+
+        assert_ne!(spectrum_rows(&low, 80), spectrum_rows(&high, 80));
+    }
 }

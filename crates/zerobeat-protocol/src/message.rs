@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use zerobeat_core::{NavigationState, Route, SessionMode, Track};
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const SPECTRUM_BAND_COUNT: usize = 24;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

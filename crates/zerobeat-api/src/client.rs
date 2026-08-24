@@ -7,17 +7,17 @@ use reqwest::{RequestBuilder, StatusCode};
 use tokio::sync::Mutex;
 use url::form_urlencoded;
 use zerobeat_catalog::{
-    AudioQuality, CatalogError, CatalogFuture, Lyrics, LyricsLine, MusicCatalog, RadioPage,
-    RadioRequest, ResolvedStream, SearchRequest,
+    AudioQuality, CatalogError, CatalogFuture, Lyrics, LyricsLine, MusicCatalog, MusicQueue,
+    QueueFuture, QueueRepeatMode, QueueSession, QueueStart, ResolvedStream, SearchRequest,
 };
 use zerobeat_core::Track;
 use zerobeat_security::{DeviceIdentity, IdentityStore, RequestToSign};
 
 use crate::{
-    ApiConfig, ApiError,
+    ApiConfig, ApiError, models,
     models::{
         ChallengeRequest, ChallengeResponse, LyricsResponse, ProvisionRequest, ProvisionResponse,
-        RadioResponse, ResolveResponse, SearchResponse, SearchTrack,
+        ResolveResponse, SearchResponse, SearchTrack,
     },
 };
 
@@ -91,25 +91,6 @@ impl ApiClient {
         Ok(response.items.into_iter().map(track_from_api).collect())
     }
 
-    async fn radio(&self, request: RadioRequest) -> Result<RadioPage, ApiError> {
-        let query = {
-            let mut serializer = form_urlencoded::Serializer::new(String::new());
-            if let Some(continuation) = request.continuation {
-                serializer.append_pair("continuation", &continuation);
-            } else {
-                serializer.append_pair("video_id", &request.seed_track_id);
-            }
-            serializer.append_pair("limit", &request.limit.to_string());
-            serializer.finish()
-        };
-        let response = self.send_signed_get("/v1/app/next", &query).await?;
-        let response: RadioResponse = parse_json(response)?;
-        Ok(RadioPage {
-            tracks: response.items.into_iter().map(track_from_api).collect(),
-            continuation: response.continuation,
-        })
-    }
-
     async fn resolve(
         &self,
         track_id: &str,
@@ -134,7 +115,116 @@ impl ApiClient {
             .ok_or(ApiError::InvalidResponse("missing audio URL"))?;
         let mut stream = ResolvedStream::new(url);
         stream.headers = response.format.http_headers.into_iter().collect();
+        stream.expires_at_epoch_seconds = (response.format.expires_at_unix_ms > 0)
+            .then(|| u64::try_from(response.format.expires_at_unix_ms / 1_000).unwrap_or_default());
         Ok(stream)
+    }
+
+    pub(crate) async fn active_queue(&self) -> Result<Option<QueueSession>, ApiError> {
+        let response = match self
+            .send_signed_request("GET", "/v1/app/player/queue/session", "", Vec::new())
+            .await
+        {
+            Ok(response) => response,
+            Err(ApiError::Rejected { status: 404, .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(
+            parse_json::<models::QueueSessionResponse>(response)?.into(),
+        ))
+    }
+
+    pub(crate) async fn start_queue(&self, request: QueueStart) -> Result<QueueSession, ApiError> {
+        let body = serde_json::to_vec(&models::QueueStartRequest::from(request))
+            .map_err(|error| ApiError::InvalidJson(error.to_string()))?;
+        self.queue_mutation("POST", "/v1/app/player/queue/sessions", body)
+            .await
+    }
+
+    async fn queue_mutation(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<QueueSession, ApiError> {
+        let response = self.send_signed_request(method, path, "", body).await?;
+        Ok(parse_json::<models::QueueSessionResponse>(response)?.into())
+    }
+
+    async fn queue_empty_mutation(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Result<QueueSession, ApiError> {
+        self.queue_mutation(method, path, Vec::new()).await
+    }
+
+    async fn queue_track_mutation(
+        &self,
+        method: &str,
+        path: &str,
+        track: &Track,
+    ) -> Result<QueueSession, ApiError> {
+        let body = serde_json::to_vec(&models::QueueTrackRequest {
+            track: models::QueueTrack::from(track),
+        })
+        .map_err(|error| ApiError::InvalidJson(error.to_string()))?;
+        self.queue_mutation(method, path, body).await
+    }
+
+    async fn queue_index_mutation(
+        &self,
+        method: &str,
+        path: &str,
+        index: usize,
+    ) -> Result<QueueSession, ApiError> {
+        let body = serde_json::to_vec(&models::QueueIndexRequest { index })
+            .map_err(|error| ApiError::InvalidJson(error.to_string()))?;
+        self.queue_mutation(method, path, body).await
+    }
+
+    async fn queue_session(&self, session_id: &str) -> Result<QueueSession, ApiError> {
+        let path = format!("/v1/app/player/queue/sessions/{session_id}");
+        let response = self
+            .send_signed_request("GET", &path, "", Vec::new())
+            .await?;
+        Ok(parse_json::<models::QueueSessionResponse>(response)?.into())
+    }
+
+    pub(crate) async fn delete_queue(&self, session_id: &str) -> Result<(), ApiError> {
+        let path = format!("/v1/app/player/queue/sessions/{session_id}");
+        self.send_signed_request("DELETE", &path, "", Vec::new())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_shuffle_queue(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<QueueSession, ApiError> {
+        let body = serde_json::to_vec(&models::QueueShuffleRequest { enabled })
+            .map_err(|error| ApiError::InvalidJson(error.to_string()))?;
+        let path = format!("/v1/app/player/queue/sessions/{session_id}/shuffle");
+        self.queue_mutation("PUT", &path, body).await
+    }
+
+    async fn set_repeat_queue(
+        &self,
+        session_id: &str,
+        mode: QueueRepeatMode,
+    ) -> Result<QueueSession, ApiError> {
+        let body = serde_json::to_vec(&models::QueueRepeatRequest {
+            mode: match mode {
+                QueueRepeatMode::None => "none",
+                QueueRepeatMode::All => "all",
+                QueueRepeatMode::One => "one",
+            }
+            .to_owned(),
+        })
+        .map_err(|error| ApiError::InvalidJson(error.to_string()))?;
+        let path = format!("/v1/app/player/queue/sessions/{session_id}/repeat");
+        self.queue_mutation("PUT", &path, body).await
     }
 
     async fn lyrics_for(&self, track: &Track) -> Result<Option<Lyrics>, ApiError> {
@@ -173,6 +263,17 @@ impl ApiClient {
     }
 
     async fn send_signed_get(&self, path: &str, raw_query: &str) -> Result<Vec<u8>, ApiError> {
+        self.send_signed_request("GET", path, raw_query, Vec::new())
+            .await
+    }
+
+    async fn send_signed_request(
+        &self,
+        method: &str,
+        path: &str,
+        raw_query: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, ApiError> {
         let host = self
             .config
             .base_url
@@ -182,15 +283,24 @@ impl ApiClient {
         let signed = {
             let mut identity = self.identity.lock().await;
             let signed = identity.sign_request(
-                RequestToSign::get(host, canonical_path, raw_query),
+                RequestToSign::with_body(method, host, canonical_path, raw_query, body.clone()),
                 unix_time_millis()?,
             )?;
             IdentityStore::save(&self.config.identity_path, &identity)?;
             signed
         };
-        let mut request = self.http.get(self.endpoint_with_query(path, raw_query));
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| ApiError::InvalidResponse("invalid HTTP method"))?;
+        let mut request = self
+            .http
+            .request(method, self.endpoint_with_query(path, raw_query));
         for (name, value) in signed.headers {
             request = request.header(name, value);
+        }
+        if !body.is_empty() {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
         }
         self.send(request).await
     }
@@ -225,17 +335,17 @@ impl ApiClient {
     }
 
     fn endpoint_with_query(&self, path: &str, raw_query: &str) -> String {
-        format!("{}?{}", self.endpoint(path), raw_query)
+        if raw_query.is_empty() {
+            self.endpoint(path)
+        } else {
+            format!("{}?{}", self.endpoint(path), raw_query)
+        }
     }
 }
 
 impl MusicCatalog for ApiClient {
     fn search_songs(&self, request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
         Box::pin(async move { self.search(request).await.map_err(catalog_error) })
-    }
-
-    fn radio_tracks(&self, request: RadioRequest) -> CatalogFuture<'_, RadioPage> {
-        Box::pin(async move { self.radio(request).await.map_err(catalog_error) })
     }
 
     fn resolve_stream(
@@ -254,6 +364,117 @@ impl MusicCatalog for ApiClient {
     fn lyrics(&self, track: &Track) -> CatalogFuture<'_, Option<Lyrics>> {
         let track = track.clone();
         Box::pin(async move { self.lyrics_for(&track).await.map_err(catalog_error) })
+    }
+}
+
+impl MusicQueue for ApiClient {
+    fn active_queue(&self) -> QueueFuture<'_, Option<QueueSession>> {
+        Box::pin(async move { self.active_queue().await.map_err(catalog_error) })
+    }
+
+    fn start_queue(&self, request: QueueStart) -> QueueFuture<'_, QueueSession> {
+        Box::pin(async move { self.start_queue(request).await.map_err(catalog_error) })
+    }
+
+    fn get_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move { self.queue_session(&session_id).await.map_err(catalog_error) })
+    }
+
+    fn delete_queue(&self, session_id: &str) -> QueueFuture<'_, ()> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move { self.delete_queue(&session_id).await.map_err(catalog_error) })
+    }
+
+    fn next_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.queue_action(session_id, "next")
+    }
+
+    fn previous_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.queue_action(session_id, "previous")
+    }
+
+    fn load_more_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.queue_action(session_id, "load-more")
+    }
+
+    fn play_next_queue(&self, session_id: &str, track: Track) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let path = format!("/v1/app/player/queue/sessions/{session_id}/play-next");
+            self.queue_track_mutation("POST", &path, &track)
+                .await
+                .map_err(catalog_error)
+        })
+    }
+
+    fn add_queue(&self, session_id: &str, track: Track) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let path = format!("/v1/app/player/queue/sessions/{session_id}/add");
+            self.queue_track_mutation("POST", &path, &track)
+                .await
+                .map_err(catalog_error)
+        })
+    }
+
+    fn play_index_queue(&self, session_id: &str, index: usize) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let path = format!("/v1/app/player/queue/sessions/{session_id}/play-index");
+            self.queue_index_mutation("POST", &path, index)
+                .await
+                .map_err(catalog_error)
+        })
+    }
+
+    fn remove_queue(&self, session_id: &str, index: usize) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let path = format!("/v1/app/player/queue/sessions/{session_id}/tracks/{index}");
+            self.queue_empty_mutation("DELETE", &path)
+                .await
+                .map_err(catalog_error)
+        })
+    }
+
+    fn clear_upcoming_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.queue_action(session_id, "clear-upcoming")
+    }
+
+    fn set_shuffle_queue(&self, session_id: &str, enabled: bool) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            self.set_shuffle_queue(&session_id, enabled)
+                .await
+                .map_err(catalog_error)
+        })
+    }
+
+    fn set_repeat_queue(
+        &self,
+        session_id: &str,
+        mode: QueueRepeatMode,
+    ) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            self.set_repeat_queue(&session_id, mode)
+                .await
+                .map_err(catalog_error)
+        })
+    }
+}
+
+impl ApiClient {
+    fn queue_action(&self, session_id: &str, action: &str) -> QueueFuture<'_, QueueSession> {
+        let session_id = session_id.to_owned();
+        let action = action.to_owned();
+        Box::pin(async move {
+            let path = format!("/v1/app/player/queue/sessions/{session_id}/{action}");
+            self.queue_empty_mutation("POST", &path)
+                .await
+                .map_err(catalog_error)
+        })
     }
 }
 

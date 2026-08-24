@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame, app: &App) -> HitMap {
         Block::new().style(Style::default().bg(theme::BACKGROUND)),
         frame.area(),
     );
-    let rows = Layout::vertical([Constraint::Min(10), Constraint::Length(9)]).split(frame.area());
+    let rows = Layout::vertical([Constraint::Min(10), Constraint::Length(12)]).split(frame.area());
 
     if rows[0].width >= WIDE_LAYOUT_MIN_COLUMNS {
         render_wide(frame, rows[0], app, &mut hits);
@@ -53,9 +53,13 @@ fn render_wide(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
 }
 
 fn render_compact(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
-    let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(7)]).split(area);
-    let header = Paragraph::new(vec![
-        Line::from(vec![
+    let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(6)]).split(area);
+    frame.render_widget(
+        Block::new().style(Style::default().bg(theme::SURFACE)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled(
                 " ZeroBeat ",
                 Style::default()
@@ -63,32 +67,81 @@ fn render_compact(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("Guest · Local", Style::default().fg(theme::ACCENT)),
-        ]),
-        Line::from(" Home  Search  Library  Downloads  Settings ")
-            .style(Style::default().fg(theme::TEXT_MUTED)),
-    ])
-    .style(Style::default().bg(theme::SURFACE));
-    frame.render_widget(header, rows[0]);
-    let nav_width = rows[0].width / 5;
-    for (index, route) in [
-        Route::Home,
-        Route::Search,
-        Route::Library,
-        Route::Downloads,
-        Route::Settings,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        hits.add(
-            MouseTarget::Navigation(route),
-            Rect::new(
-                rows[0].x.saturating_add(nav_width * index as u16),
-                rows[0].y.saturating_add(1),
-                nav_width,
-                2,
-            ),
+        ])),
+        Rect::new(rows[0].x, rows[0].y, rows[0].width, 1),
+    );
+
+    let items = [
+        ("1 Library", MouseTarget::Navigation(Route::Library), false),
+        (
+            "2 Recent",
+            MouseTarget::Navigation(Route::RecentlyPlayed),
+            false,
+        ),
+        (
+            "3 Downloads",
+            MouseTarget::Navigation(Route::Downloads),
+            false,
+        ),
+        ("4 Home", MouseTarget::Navigation(Route::Home), false),
+        ("5 Search", MouseTarget::Navigation(Route::Search), false),
+        ("6 Queue", MouseTarget::Queue, true),
+        ("7 Lyrics", MouseTarget::Lyrics, true),
+        (
+            "8 Settings",
+            MouseTarget::Navigation(Route::Settings),
+            false,
+        ),
+    ];
+    let cell_width = (rows[0].width / 4).max(1);
+    for (index, (label, target, overlay)) in items.into_iter().enumerate() {
+        let row = index / 4;
+        let column = index % 4;
+        let cell = Rect::new(
+            rows[0]
+                .x
+                .saturating_add(cell_width.saturating_mul(column as u16)),
+            rows[0].y.saturating_add(1 + row as u16),
+            if column == 3 {
+                rows[0].width.saturating_sub(cell_width.saturating_mul(3))
+            } else {
+                cell_width
+            },
+            1,
         );
+        let active = if overlay {
+            match target {
+                MouseTarget::Queue => app.queue_focused(),
+                MouseTarget::Lyrics => app.lyrics().visible,
+                _ => false,
+            }
+        } else {
+            match target {
+                MouseTarget::Navigation(route) => app.route() == route,
+                _ => false,
+            }
+        };
+        let marker = if active {
+            if overlay { "·" } else { "│" }
+        } else {
+            " "
+        };
+        let style = Style::default()
+            .fg(if active {
+                if overlay { theme::ACCENT } else { theme::TEXT }
+            } else {
+                theme::TEXT_MUTED
+            })
+            .add_modifier(if active {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        frame.render_widget(
+            Paragraph::new(format!("{marker} {label}")).style(style),
+            cell,
+        );
+        hits.add(target, cell);
     }
     render_content(frame, rows[1], app, hits);
 }
@@ -115,11 +168,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
         "Liked Songs",
         Some(app.library().liked.len()),
     );
-    targets.push((lines.len(), MouseTarget::Navigation(Route::Home)));
+    targets.push((lines.len(), MouseTarget::Navigation(Route::RecentlyPlayed)));
     lines.push(menu_line(
         2,
         "Recently Played",
-        false,
+        app.route() == Route::RecentlyPlayed,
         Some(app.library().recent.len()),
     ));
     push_nav(
@@ -146,14 +199,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     lines.push(Line::raw(""));
     lines.push(section("PLAYBACK"));
     targets.push((lines.len(), MouseTarget::Queue));
-    lines.push(menu_line(
+    lines.push(overlay_line(
         6,
         "Queue",
         app.queue_focused(),
         Some(app.playback().queue.len()),
     ));
     targets.push((lines.len(), MouseTarget::Lyrics));
-    lines.push(menu_line(7, "Lyrics", app.lyrics().visible, None));
+    lines.push(overlay_line(7, "Lyrics", app.lyrics().visible, None));
     lines.push(Line::raw(""));
     lines.push(section("SYSTEM"));
     push_nav(
@@ -239,6 +292,25 @@ fn menu_line(shortcut: u8, label: &str, active: bool, count: Option<usize>) -> L
                 theme::TEXT_MUTED
             })
             .add_modifier(if active {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+    )
+}
+
+fn overlay_line(shortcut: u8, label: &str, open: bool, count: Option<usize>) -> Line<'static> {
+    let marker = if open { "·" } else { " " };
+    let count = count.map(|value| format!("  {value}")).unwrap_or_default();
+    Line::styled(
+        format!("{marker}  {shortcut}  {label}{count}"),
+        Style::default()
+            .fg(if open {
+                theme::ACCENT
+            } else {
+                theme::TEXT_MUTED
+            })
+            .add_modifier(if open {
                 Modifier::BOLD
             } else {
                 Modifier::empty()

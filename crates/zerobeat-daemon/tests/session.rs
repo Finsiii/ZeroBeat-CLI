@@ -6,10 +6,10 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
-use zerobeat_audio::{AudioBackend, BackendError, BackendTelemetry, StreamSource};
+use zerobeat_audio::{AudioBackend, BackendError, BackendTelemetry, DualDeck, StreamSource};
 use zerobeat_catalog::{
-    AudioQuality, CatalogFuture, Lyrics, LyricsLine, MusicCatalog, RadioPage, RadioRequest,
-    ResolvedStream, SearchRequest,
+    AudioQuality, CatalogFuture, Lyrics, LyricsLine, MusicCatalog, MusicQueue, QueueFuture,
+    QueueRepeatMode, QueueSession, QueueStart, ResolvedStream, SearchRequest,
 };
 use zerobeat_core::{Route, SessionMode, Track};
 use zerobeat_daemon::{DaemonError, DaemonServer};
@@ -70,20 +70,46 @@ async fn second_daemon_cannot_replace_a_live_socket() {
 }
 
 #[tokio::test]
+async fn rejects_older_protocol_before_serving_snapshot() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let server = DaemonServer::bind(&socket).await.unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+
+    let rejected = exchange(
+        &mut client,
+        ClientCommand::Hello {
+            protocol_version: PROTOCOL_VERSION - 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        rejected,
+        DaemonEvent::Rejected(format!(
+            "unsupported protocol version {}",
+            PROTOCOL_VERSION - 1
+        ))
+    );
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn search_runs_in_background_and_updates_the_snapshot() {
     let directory = tempdir().unwrap();
     let socket = directory.path().join("zerobeat.sock");
     let events = Arc::new(Mutex::new(Vec::new()));
-    let server = DaemonServer::bind_with_services(
+    let server = DaemonServer::bind_with_services_and_queue(
         &socket,
         TestCatalog,
+        TestQueue::default(),
         RecordingBackend(Arc::clone(&events)),
     )
     .await
     .unwrap();
     let server_task = tokio::spawn(server.run());
     let mut client = IpcConnection::connect(&socket).await.unwrap();
-
     exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
     let loading = exchange(&mut client, ClientCommand::SubmitSearch).await;
     let DaemonEvent::Snapshot(loading) = loading else {
@@ -156,9 +182,9 @@ async fn search_runs_in_background_and_updates_the_snapshot() {
     let DaemonEvent::Snapshot(next) = next else {
         panic!("expected next snapshot");
     };
-    assert_eq!(next.playback.current.as_ref().unwrap().title, "Sialan");
-    assert_eq!(next.playback.status, PlaybackStatus::Resolving);
-    assert_eq!(next.playback.queue.len(), 1);
+    assert_eq!(next.playback.current.as_ref().unwrap().title, "Tampar");
+    assert_eq!(next.playback.status, PlaybackStatus::Playing);
+    assert_eq!(next.playback.queue.len(), 2);
 
     let playing_next = loop {
         let event = exchange(&mut client, ClientCommand::RequestSnapshot).await;
@@ -195,9 +221,10 @@ async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
     let directory = tempdir().unwrap();
     let socket = directory.path().join("zerobeat.sock");
     let events = Arc::new(Mutex::new(Vec::new()));
-    let server = DaemonServer::bind_with_services(
+    let server = DaemonServer::bind_with_services_and_queue(
         &socket,
         TestCatalog,
+        TestQueue::default(),
         RecordingBackend(Arc::clone(&events)),
     )
     .await
@@ -257,15 +284,14 @@ async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
     let DaemonEvent::Snapshot(next) = next else {
         panic!("expected snapshot");
     };
-    assert_eq!(next.playback.history.len(), 1);
-    let next_title = next.playback.current.as_ref().unwrap().title.clone();
+    assert!(next.playback.history.is_empty());
     let previous = exchange(&mut client, ClientCommand::PreviousTrack).await;
     let DaemonEvent::Snapshot(previous) = previous else {
         panic!("expected snapshot");
     };
-    assert_eq!(previous.playback.current.as_ref().unwrap().title, "Tampar");
-    assert_eq!(previous.playback.queue[0].title, next_title);
-    assert!(previous.playback.history.is_empty());
+    assert_eq!(previous.playback.current.as_ref().unwrap().title, "Sialan");
+    assert_eq!(previous.playback.queue[0].title, "Lampu Kuning");
+    assert_eq!(previous.playback.history.len(), 1);
 
     wait_for(&mut client, |snapshot| {
         snapshot.playback.status == PlaybackStatus::Playing
@@ -281,7 +307,10 @@ async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
     let DaemonEvent::Snapshot(previous) = previous else {
         panic!("expected snapshot");
     };
-    assert_eq!(previous.playback.current.as_ref().unwrap().title, "Tampar");
+    assert_eq!(
+        previous.playback.current.as_ref().unwrap().title,
+        "Direct Pick"
+    );
     let queue_len = previous.playback.queue.len();
 
     let removed = exchange(&mut client, ClientCommand::RemoveQueueIndex(0)).await;
@@ -307,9 +336,10 @@ async fn playback_auto_advances_before_the_current_track_ends() {
     let socket = directory.path().join("zerobeat.sock");
     let events = Arc::new(Mutex::new(Vec::new()));
     let near_end = Arc::new(AtomicBool::new(false));
-    let server = DaemonServer::bind_with_services(
+    let server = DaemonServer::bind_with_services_and_queue(
         &socket,
         TestCatalog,
+        TestQueue::default(),
         AutoAdvanceBackend {
             events: Arc::clone(&events),
             near_end: Arc::clone(&near_end),
@@ -369,177 +399,15 @@ async fn playback_auto_advances_before_the_current_track_ends() {
 }
 
 #[tokio::test]
-async fn endless_radio_keeps_the_visible_queue_unique_and_capped_at_twelve() {
-    let directory = tempdir().unwrap();
-    let socket = directory.path().join("zerobeat.sock");
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let radio_calls = Arc::new(AtomicUsize::new(0));
-    let server = DaemonServer::bind_with_services(
-        &socket,
-        EndlessCatalog {
-            radio_calls: Arc::clone(&radio_calls),
-        },
-        RecordingBackend(Arc::clone(&events)),
-    )
-    .await
-    .unwrap();
-    let server_task = tokio::spawn(server.run());
-    let mut client = IpcConnection::connect(&socket).await.unwrap();
-
-    exchange(&mut client, ClientCommand::UpdateSearch("seed".into())).await;
-    exchange(&mut client, ClientCommand::SubmitSearch).await;
-    wait_for(&mut client, |snapshot| {
-        snapshot.search.status == SearchStatus::Ready
-    })
-    .await;
-    let started = exchange(&mut client, ClientCommand::PlaySelected).await;
-    let DaemonEvent::Snapshot(started) = started else {
-        panic!("expected playback snapshot");
-    };
-    assert_eq!(started.playback.queue.len(), 12);
-
-    wait_for(&mut client, |_| radio_calls.load(Ordering::Acquire) > 0).await;
-    for _ in 0..8 {
-        let advanced = exchange(&mut client, ClientCommand::NextTrack).await;
-        let DaemonEvent::Snapshot(advanced) = advanced else {
-            panic!("expected next snapshot");
-        };
-        assert_eq!(advanced.playback.queue.len(), 12);
-        let unique = advanced
-            .playback
-            .queue
-            .iter()
-            .map(|track| track.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(unique.len(), 12);
-    }
-
-    exchange(&mut client, ClientCommand::Shutdown).await;
-    server_task.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn endless_radio_retries_transient_failure_with_backoff() {
-    let directory = tempdir().unwrap();
-    let socket = directory.path().join("zerobeat.sock");
-    let radio_calls = Arc::new(AtomicUsize::new(0));
-    let server = DaemonServer::bind_with_services(
-        &socket,
-        RetryingRadioCatalog {
-            radio_calls: Arc::clone(&radio_calls),
-        },
-        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .await
-    .unwrap();
-    let server_task = tokio::spawn(server.run());
-    let mut client = IpcConnection::connect(&socket).await.unwrap();
-
-    exchange(
-        &mut client,
-        ClientCommand::PlayTrack(Track::new("seed", "Seed", "ZeroBeat", 180_000)),
-    )
-    .await;
-    wait_for_calls(&radio_calls, 1).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(radio_calls.load(Ordering::Acquire), 1);
-
-    let refilled = wait_for(&mut client, |snapshot| snapshot.playback.queue.len() == 12).await;
-    assert_eq!(refilled.playback.queue.len(), 12);
-    assert_eq!(radio_calls.load(Ordering::Acquire), 2);
-
-    exchange(&mut client, ClientCommand::Shutdown).await;
-    server_task.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn endless_radio_stops_when_continuation_makes_no_progress() {
-    let directory = tempdir().unwrap();
-    let socket = directory.path().join("zerobeat.sock");
-    let radio_calls = Arc::new(AtomicUsize::new(0));
-    let server = DaemonServer::bind_with_services(
-        &socket,
-        NoProgressRadioCatalog {
-            radio_calls: Arc::clone(&radio_calls),
-        },
-        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .await
-    .unwrap();
-    let server_task = tokio::spawn(server.run());
-    let mut client = IpcConnection::connect(&socket).await.unwrap();
-
-    exchange(
-        &mut client,
-        ClientCommand::PlayTrack(Track::new("seed", "Seed", "ZeroBeat", 180_000)),
-    )
-    .await;
-    wait_for_calls(&radio_calls, 2).await;
-    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-    assert_eq!(radio_calls.load(Ordering::Acquire), 2);
-
-    exchange(&mut client, ClientCommand::Shutdown).await;
-    server_task.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn clearing_queue_invalidates_an_inflight_radio_response() {
-    let directory = tempdir().unwrap();
-    let socket = directory.path().join("zerobeat.sock");
-    let radio_started = Arc::new(Notify::new());
-    let release_radio = Arc::new(Notify::new());
-    let radio_calls = Arc::new(AtomicUsize::new(0));
-    let server = DaemonServer::bind_with_services(
-        &socket,
-        BlockingRadioCatalog {
-            radio_started: Arc::clone(&radio_started),
-            release_radio: Arc::clone(&release_radio),
-            radio_calls: Arc::clone(&radio_calls),
-        },
-        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .await
-    .unwrap();
-    let server_task = tokio::spawn(server.run());
-    let mut client = IpcConnection::connect(&socket).await.unwrap();
-
-    exchange(
-        &mut client,
-        ClientCommand::PlayTrack(Track::new("seed", "Seed", "ZeroBeat", 180_000)),
-    )
-    .await;
-    tokio::time::timeout(std::time::Duration::from_secs(1), radio_started.notified())
-        .await
-        .expect("radio request did not start");
-
-    let cleared = exchange(&mut client, ClientCommand::ClearQueue).await;
-    let DaemonEvent::Snapshot(cleared) = cleared else {
-        panic!("expected clear snapshot");
-    };
-    assert!(cleared.playback.queue.is_empty());
-
-    release_radio.notify_one();
-    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-    let settled = exchange(&mut client, ClientCommand::RequestSnapshot).await;
-    let DaemonEvent::Snapshot(settled) = settled else {
-        panic!("expected settled snapshot");
-    };
-    assert!(settled.playback.queue.is_empty());
-    assert_eq!(radio_calls.load(Ordering::Acquire), 1);
-
-    exchange(&mut client, ClientCommand::Shutdown).await;
-    server_task.await.unwrap().unwrap();
-}
-
-#[tokio::test]
 async fn repeat_one_restarts_the_current_track_without_consuming_the_queue() {
     let directory = tempdir().unwrap();
     let socket = directory.path().join("zerobeat.sock");
     let events = Arc::new(Mutex::new(Vec::new()));
     let ended = Arc::new(AtomicBool::new(false));
-    let server = DaemonServer::bind_with_services(
+    let server = DaemonServer::bind_with_services_and_queue(
         &socket,
         TestCatalog,
+        TestQueue::default(),
         RepeatBackend {
             events: Arc::clone(&events),
             ended: Arc::clone(&ended),
@@ -549,6 +417,7 @@ async fn repeat_one_restarts_the_current_track_without_consuming_the_queue() {
     .unwrap();
     let server_task = tokio::spawn(server.run());
     let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::SetCrossfadeSeconds(0)).await;
 
     exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
     exchange(&mut client, ClientCommand::SubmitSearch).await;
@@ -591,12 +460,13 @@ async fn skipping_a_resolving_track_with_an_empty_queue_cancels_its_start() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let resolve_started = Arc::new(Notify::new());
     let release_resolve = Arc::new(Notify::new());
-    let server = DaemonServer::bind_with_services(
+    let server = DaemonServer::bind_with_services_and_queue(
         &socket,
         DelayedCatalog {
             resolve_started: Arc::clone(&resolve_started),
             release_resolve: Arc::clone(&release_resolve),
         },
+        TestQueue::default(),
         RecordingBackend(Arc::clone(&events)),
     )
     .await
@@ -620,7 +490,7 @@ async fn skipping_a_resolving_track_with_an_empty_queue_cancels_its_start() {
     let DaemonEvent::Snapshot(stopped) = stopped else {
         panic!("expected snapshot");
     };
-    assert_eq!(stopped.playback.status, PlaybackStatus::Idle);
+    assert_eq!(stopped.playback.status, PlaybackStatus::Failed);
     assert!(stopped.playback.current.is_none());
 
     release_resolve.notify_waiters();
@@ -629,9 +499,386 @@ async fn skipping_a_resolving_track_with_an_empty_queue_cancels_its_start() {
     let DaemonEvent::Snapshot(settled) = settled else {
         panic!("expected snapshot");
     };
-    assert_eq!(settled.playback.status, PlaybackStatus::Idle);
+    assert_eq!(settled.playback.status, PlaybackStatus::Failed);
     assert!(settled.playback.current.is_none());
-    assert_eq!(*events.lock().unwrap(), ["stop"]);
+    assert!(events.lock().unwrap().is_empty());
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn failed_incoming_load_preserves_audible_current_and_queue() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ended = Arc::new(AtomicBool::new(false));
+    let queue = TestQueue::default();
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        DualDeck::new(
+            FailingDeck::with_end_flag("a", Arc::clone(&events), Arc::clone(&ended)),
+            FailingDeck::with_end_flag("b", Arc::clone(&events), Arc::clone(&ended)),
+        ),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    let before = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    assert_eq!(before.playback.current.as_ref().unwrap().id, "video-123");
+    events.lock().unwrap().clear();
+    let next = exchange(&mut client, ClientCommand::NextTrack).await;
+    let DaemonEvent::Snapshot(next) = next else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(next.playback.status, PlaybackStatus::Playing);
+    assert_eq!(next.playback.current.as_ref().unwrap().id, "video-123");
+    assert_eq!(next.playback.queue, before.playback.queue);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "b:load:video-456:failed")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    {
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "b:load:video-456:failed")
+        );
+        assert!(!events.iter().any(|event| event == "a:stop"));
+    }
+
+    ended.store(true, Ordering::Release);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(queue.next_calls.load(Ordering::Acquire), 1);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn queue_index_is_rejected_while_transition_is_pending() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let queue = TestQueue::default();
+    let load_started = Arc::new(AtomicBool::new(false));
+    let release_load = Arc::new(AtomicBool::new(false));
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        BlockingIncomingBackend {
+            load_started: Arc::clone(&load_started),
+            release_load: Arc::clone(&release_load),
+        },
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+
+    exchange(&mut client, ClientCommand::NextTrack).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !load_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("incoming load did not become pending");
+    let rejected = exchange(&mut client, ClientCommand::RemoveQueueIndex(0)).await;
+    let DaemonEvent::Snapshot(rejected) = rejected else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(rejected.playback.status, PlaybackStatus::Playing);
+    assert_eq!(
+        rejected
+            .playback
+            .current
+            .as_ref()
+            .map(|track| track.id.as_str()),
+        Some("video-123")
+    );
+    assert_eq!(
+        rejected.playback.error.as_deref(),
+        Some("playback transition is pending")
+    );
+    assert!(queue.index_calls.lock().unwrap().is_empty());
+
+    release_load.store(true, Ordering::Release);
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && snapshot
+                .playback
+                .current
+                .as_ref()
+                .is_some_and(|track| track.id == "video-456")
+    })
+    .await;
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn endless_queue_refills_to_max_visible_after_start_and_next() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let queue = TestQueue {
+        initial_upcoming: Some(9),
+        load_more_failures: Arc::new(AtomicUsize::new(1)),
+        refill: true,
+        ..TestQueue::default()
+    };
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    let initial = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing && snapshot.playback.queue.len() == 12
+    })
+    .await;
+    assert_eq!(initial.playback.queue.len(), 12);
+
+    exchange(&mut client, ClientCommand::NextTrack).await;
+    let next = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && snapshot
+                .playback
+                .current
+                .as_ref()
+                .is_some_and(|track| track.id == "video-456")
+            && snapshot.playback.queue.len() == 12
+    })
+    .await;
+    assert_eq!(next.playback.queue.len(), 12);
+    assert!(queue.load_more_calls.load(Ordering::Acquire) >= 2);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn finite_queue_does_not_schedule_refill() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let queue = TestQueue {
+        finite: true,
+        ..TestQueue::default()
+    };
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    let settled = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    assert_eq!(settled.playback.queue.len(), 2);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(queue.load_more_calls.load(Ordering::Acquire), 0);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn exhausted_endless_queue_refill_stops_after_no_progress() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let queue = TestQueue::default();
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    let settled = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    assert_eq!(settled.playback.queue.len(), 2);
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(queue.load_more_calls.load(Ordering::Acquire), 1);
+    exchange(&mut client, ClientCommand::ToggleShuffle).await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(queue.load_more_calls.load(Ordering::Acquire), 2);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn terminal_auto_advance_error_is_not_retried_every_tick() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let ended = Arc::new(AtomicBool::new(false));
+    let queue = TestQueue {
+        next_terminal: true,
+        ..TestQueue::default()
+    };
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        RepeatBackend {
+            events: Arc::new(Mutex::new(Vec::new())),
+            ended: Arc::clone(&ended),
+        },
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::SetCrossfadeSeconds(0)).await;
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    ended.store(true, Ordering::Release);
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(queue.next_calls.load(Ordering::Acquire), 1);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn finite_tail_success_without_position_change_is_not_reloaded() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ended = Arc::new(AtomicBool::new(false));
+    let queue = TestQueue {
+        next_stall_success: true,
+        ..TestQueue::default()
+    };
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        RepeatBackend {
+            events: Arc::clone(&events),
+            ended: Arc::clone(&ended),
+        },
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+    exchange(&mut client, ClientCommand::SetCrossfadeSeconds(0)).await;
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlayQueueIndex(1)).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && snapshot
+                .playback
+                .current
+                .as_ref()
+                .is_some_and(|track| track.id == "video-789")
+    })
+    .await;
+    let reloads_before_end = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| **event == "load:https://stream.example/lampu")
+        .count();
+    ended.store(true, Ordering::Release);
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(queue.next_calls.load(Ordering::Acquire), 1);
+    let reloads_after_end = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| **event == "load:https://stream.example/lampu")
+        .count();
+    assert_eq!(reloads_after_end, reloads_before_end);
 
     exchange(&mut client, ClientCommand::Shutdown).await;
     server_task.await.unwrap().unwrap();
@@ -644,9 +891,10 @@ async fn a_track_superseded_during_blocking_load_never_starts() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let first_load_started = Arc::new(AtomicBool::new(false));
     let release_first_load = Arc::new(AtomicBool::new(false));
-    let server = DaemonServer::bind_with_services(
+    let server = DaemonServer::bind_with_services_and_queue(
         &socket,
         TestCatalog,
+        TestQueue::default(),
         BlockingLoadBackend {
             events: Arc::clone(&events),
             loaded: String::new(),
@@ -704,9 +952,10 @@ async fn guest_library_survives_daemon_restart() {
     let directory = tempdir().unwrap();
     let socket = directory.path().join("zerobeat.sock");
     let database_path = directory.path().join("guest.db");
-    let server = DaemonServer::bind_with_services_and_storage(
+    let server = DaemonServer::bind_with_services_and_storage_and_queue(
         &socket,
         TestCatalog,
+        TestQueue::default(),
         RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
         Database::open(&database_path).unwrap(),
         directory.path().join("downloads"),
@@ -744,9 +993,10 @@ async fn guest_library_survives_daemon_restart() {
     exchange(&mut client, ClientCommand::Shutdown).await;
     server_task.await.unwrap().unwrap();
 
-    let server = DaemonServer::bind_with_services_and_storage(
+    let server = DaemonServer::bind_with_services_and_storage_and_queue(
         &socket,
         TestCatalog,
+        TestQueue::default(),
         RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
         Database::open(&database_path).unwrap(),
         directory.path().join("downloads"),
@@ -805,7 +1055,7 @@ async fn guest_download_uses_query_range_and_becomes_playable_offline() {
             stream.write_all(body).await.unwrap();
         }
     });
-    let server = DaemonServer::bind_with_services_and_storage(
+    let server = DaemonServer::bind_with_services_and_storage_and_queue(
         &socket,
         DownloadCatalog {
             url: format!(
@@ -815,6 +1065,7 @@ async fn guest_download_uses_query_range_and_becomes_playable_offline() {
             ),
             resolve_count: Arc::new(AtomicUsize::new(0)),
         },
+        TestQueue::default(),
         RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
         Database::open(directory.path().join("guest.db")).unwrap(),
         &downloads,
@@ -881,9 +1132,10 @@ async fn available_download_plays_without_resolving_the_network() {
         )
         .unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
-    let server = DaemonServer::bind_with_services_and_storage(
+    let server = DaemonServer::bind_with_services_and_storage_and_queue(
         &socket,
         FailingCatalog,
+        TestQueue::default(),
         RecordingBackend(Arc::clone(&events)),
         database,
         directory.path().join("downloads"),
@@ -936,16 +1188,6 @@ async fn wait_for(
     })
     .await
     .expect("snapshot condition timed out")
-}
-
-async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while calls.load(Ordering::Acquire) < expected {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("catalog call condition timed out");
 }
 
 fn assert_snapshot(
@@ -1087,193 +1329,350 @@ impl MusicCatalog for TestCatalog {
     }
 }
 
-struct EndlessCatalog {
-    radio_calls: Arc<AtomicUsize>,
+#[derive(Clone, Default)]
+struct TestQueue {
+    state: Arc<Mutex<Option<QueueSession>>>,
+    index_calls: Arc<Mutex<Vec<usize>>>,
+    next_calls: Arc<AtomicUsize>,
+    next_terminal: bool,
+    next_stall_success: bool,
+    load_more_calls: Arc<AtomicUsize>,
+    load_more_failures: Arc<AtomicUsize>,
+    refill: bool,
+    finite: bool,
+    initial_upcoming: Option<usize>,
 }
 
-struct RetryingRadioCatalog {
-    radio_calls: Arc<AtomicUsize>,
-}
-
-struct NoProgressRadioCatalog {
-    radio_calls: Arc<AtomicUsize>,
-}
-
-struct BlockingRadioCatalog {
-    radio_started: Arc<Notify>,
-    release_radio: Arc<Notify>,
-    radio_calls: Arc<AtomicUsize>,
-}
-
-impl MusicCatalog for EndlessCatalog {
-    fn search_songs(&self, request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
+impl TestQueue {
+    fn mutate<F>(&self, session_id: &str, operation: F) -> QueueFuture<'_, QueueSession>
+    where
+        F: FnOnce(&mut QueueSession) + Send + 'static,
+    {
+        let state = Arc::clone(&self.state);
+        let session_id = session_id.to_owned();
         Box::pin(async move {
-            assert_eq!(request.query, "seed");
-            Ok((0..20)
-                .map(|index| {
-                    Track::new(
-                        format!("search-{index}"),
-                        format!("Search {index}"),
-                        "ZeroBeat",
-                        180_000,
-                    )
-                })
-                .collect())
-        })
-    }
-
-    fn radio_tracks(&self, request: RadioRequest) -> CatalogFuture<'_, RadioPage> {
-        self.radio_calls.fetch_add(1, Ordering::Release);
-        Box::pin(async move {
-            assert_eq!(request.limit, 24);
-            Ok(RadioPage {
-                tracks: (0..24)
-                    .map(|index| {
-                        Track::new(
-                            format!("radio-{index}"),
-                            format!("Radio {index}"),
-                            "ZeroBeat",
-                            180_000,
-                        )
-                    })
-                    .collect(),
-                continuation: Some("next-radio-page".into()),
-            })
-        })
-    }
-
-    fn resolve_stream(
-        &self,
-        track_id: &str,
-        _quality: AudioQuality,
-    ) -> CatalogFuture<'_, ResolvedStream> {
-        let track_id = track_id.to_owned();
-        Box::pin(async move {
-            Ok(ResolvedStream::new(format!(
-                "https://stream.example/{track_id}"
-            )))
+            let mut state = state.lock().unwrap();
+            let session = state
+                .as_mut()
+                .filter(|session| session.id == session_id)
+                .ok_or_else(|| {
+                    zerobeat_catalog::CatalogError::Unavailable("session missing".into())
+                })?;
+            operation(session);
+            session.revision += 1;
+            Ok(session.clone())
         })
     }
 }
 
-impl MusicCatalog for RetryingRadioCatalog {
-    fn search_songs(&self, _request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
-        Box::pin(async { Ok(Vec::new()) })
+impl MusicQueue for TestQueue {
+    fn active_queue(&self) -> QueueFuture<'_, Option<QueueSession>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move { Ok(state.lock().unwrap().clone()) })
     }
 
-    fn radio_tracks(&self, request: RadioRequest) -> CatalogFuture<'_, RadioPage> {
-        let call = self.radio_calls.fetch_add(1, Ordering::AcqRel) + 1;
+    fn start_queue(&self, request: QueueStart) -> QueueFuture<'_, QueueSession> {
+        let state = Arc::clone(&self.state);
+        let finite = self.finite;
+        let initial_upcoming = self.initial_upcoming;
         Box::pin(async move {
-            assert_eq!(request.limit, 24);
-            if call == 1 {
-                return Err(zerobeat_catalog::CatalogError::Unavailable(
-                    "temporary radio failure".into(),
+            let mut tracks = request.tracks;
+            if let Some(track) = request.track
+                && !tracks.iter().any(|candidate| candidate.id == track.id)
+            {
+                tracks.insert(request.current_index.min(tracks.len()), track);
+            }
+            if tracks.is_empty() {
+                return Err(zerobeat_catalog::CatalogError::InvalidResponse(
+                    "test queue requires a track".into(),
                 ));
             }
-            Ok(RadioPage {
-                tracks: (0..24)
-                    .map(|index| {
-                        Track::new(
-                            format!("retry-radio-{index}"),
-                            format!("Retry Radio {index}"),
-                            "ZeroBeat",
-                            180_000,
-                        )
-                    })
-                    .collect(),
-                continuation: None,
+            let current_index = request.current_index.min(tracks.len() - 1);
+            if let Some(upcoming) = initial_upcoming {
+                while tracks.len() < current_index + 1 + upcoming {
+                    let index = tracks.len();
+                    tracks.push(Track::new(
+                        format!("initial-{index}"),
+                        format!("Initial {index}"),
+                        "ZeroBeat",
+                        240_000,
+                    ));
+                }
+            }
+            let session = QueueSession {
+                id: "test-session".into(),
+                state: "playing".into(),
+                play_order: (0..tracks.len()).collect(),
+                tracks,
+                current_index,
+                shuffle: request.shuffle,
+                repeat_mode: request.repeat_mode,
+                endless_queue: request.endless_queue && !finite,
+                revision: 1,
+                ..QueueSession::default()
+            };
+            *state.lock().unwrap() = Some(session.clone());
+            Ok(session)
+        })
+    }
+
+    fn get_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        let state = Arc::clone(&self.state);
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            state
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|session| session.id == session_id)
+                .ok_or_else(|| {
+                    zerobeat_catalog::CatalogError::Unavailable("session missing".into())
+                })
+        })
+    }
+
+    fn delete_queue(&self, session_id: &str) -> QueueFuture<'_, ()> {
+        let state = Arc::clone(&self.state);
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            if state
+                .as_ref()
+                .is_some_and(|session| session.id == session_id)
+            {
+                *state = None;
+                Ok(())
+            } else {
+                Err(zerobeat_catalog::CatalogError::Unavailable(
+                    "session missing".into(),
+                ))
+            }
+        })
+    }
+
+    fn next_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.next_calls.fetch_add(1, Ordering::AcqRel);
+        if self.next_terminal {
+            return Box::pin(async {
+                Err(zerobeat_catalog::CatalogError::Unavailable(
+                    "queue ended".into(),
+                ))
+            });
+        }
+        if self.next_stall_success {
+            let state = Arc::clone(&self.state);
+            let session_id = session_id.to_owned();
+            return Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                let session = state
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                    .ok_or_else(|| {
+                        zerobeat_catalog::CatalogError::Unavailable("session missing".into())
+                    })?;
+                session.revision += 1;
+                Ok(session.clone())
+            });
+        }
+        let state = Arc::clone(&self.state);
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            let session = state
+                .as_mut()
+                .filter(|session| session.id == session_id)
+                .ok_or_else(|| {
+                    zerobeat_catalog::CatalogError::Unavailable("session missing".into())
+                })?;
+            if session.repeat_mode == QueueRepeatMode::One {
+                session.revision += 1;
+            } else if session.current_index + 1 < session.tracks.len() {
+                session.current_index += 1;
+                session.revision += 1;
+            } else if session.repeat_mode == QueueRepeatMode::All {
+                session.current_index = 0;
+                session.revision += 1;
+            } else {
+                return Err(zerobeat_catalog::CatalogError::Unavailable(
+                    "queue ended".into(),
+                ));
+            }
+            Ok(session.clone())
+        })
+    }
+
+    fn previous_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.mutate(session_id, |session| {
+            session.current_index = session.current_index.saturating_sub(1)
+        })
+    }
+
+    fn load_more_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.load_more_calls.fetch_add(1, Ordering::AcqRel);
+        if self
+            .load_more_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
             })
+            .is_ok()
+        {
+            return Box::pin(async {
+                Err(zerobeat_catalog::CatalogError::Unavailable(
+                    "temporary load-more failure".into(),
+                ))
+            });
+        }
+        let refill = self.refill;
+        self.mutate(session_id, move |session| {
+            if refill {
+                while session.tracks.len() < session.current_index + 1 + 12 {
+                    let index = session.tracks.len();
+                    session.tracks.push(Track::new(
+                        format!("refill-{index}"),
+                        format!("Refill {index}"),
+                        "ZeroBeat",
+                        240_000,
+                    ));
+                    session.play_order = (0..session.tracks.len()).collect();
+                }
+            }
         })
     }
 
-    fn resolve_stream(
+    fn play_next_queue(&self, session_id: &str, track: Track) -> QueueFuture<'_, QueueSession> {
+        self.mutate(session_id, move |session| {
+            let index = session
+                .current_index
+                .saturating_add(1)
+                .min(session.tracks.len());
+            session.tracks.insert(index, track);
+            session.play_order = (0..session.tracks.len()).collect();
+        })
+    }
+
+    fn add_queue(&self, session_id: &str, track: Track) -> QueueFuture<'_, QueueSession> {
+        self.mutate(session_id, move |session| {
+            session.tracks.push(track);
+            session.play_order = (0..session.tracks.len()).collect();
+        })
+    }
+
+    fn play_index_queue(&self, session_id: &str, index: usize) -> QueueFuture<'_, QueueSession> {
+        self.index_calls.lock().unwrap().push(index);
+        self.mutate(session_id, move |session| {
+            if index < session.tracks.len() {
+                session.current_index = index;
+            }
+        })
+    }
+
+    fn remove_queue(&self, session_id: &str, index: usize) -> QueueFuture<'_, QueueSession> {
+        self.index_calls.lock().unwrap().push(index);
+        self.mutate(session_id, move |session| {
+            if index < session.tracks.len() && index != session.current_index {
+                session.tracks.remove(index);
+                session.play_order = (0..session.tracks.len()).collect();
+            }
+        })
+    }
+
+    fn clear_upcoming_queue(&self, session_id: &str) -> QueueFuture<'_, QueueSession> {
+        self.mutate(session_id, |session| {
+            session.tracks.truncate(session.current_index + 1)
+        })
+    }
+
+    fn set_shuffle_queue(&self, session_id: &str, enabled: bool) -> QueueFuture<'_, QueueSession> {
+        self.mutate(session_id, move |session| session.shuffle = enabled)
+    }
+
+    fn set_repeat_queue(
         &self,
-        track_id: &str,
-        _quality: AudioQuality,
-    ) -> CatalogFuture<'_, ResolvedStream> {
-        let track_id = track_id.to_owned();
-        Box::pin(async move {
-            Ok(ResolvedStream::new(format!(
-                "https://stream.example/{track_id}"
-            )))
-        })
-    }
-}
-
-impl MusicCatalog for NoProgressRadioCatalog {
-    fn search_songs(&self, _request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn radio_tracks(&self, request: RadioRequest) -> CatalogFuture<'_, RadioPage> {
-        self.radio_calls.fetch_add(1, Ordering::AcqRel);
-        Box::pin(async move {
-            assert_eq!(request.limit, 24);
-            Ok(RadioPage {
-                tracks: Vec::new(),
-                continuation: Some("next".into()),
-            })
-        })
-    }
-
-    fn resolve_stream(
-        &self,
-        track_id: &str,
-        _quality: AudioQuality,
-    ) -> CatalogFuture<'_, ResolvedStream> {
-        let track_id = track_id.to_owned();
-        Box::pin(async move {
-            Ok(ResolvedStream::new(format!(
-                "https://stream.example/{track_id}"
-            )))
-        })
-    }
-}
-
-impl MusicCatalog for BlockingRadioCatalog {
-    fn search_songs(&self, _request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn radio_tracks(&self, request: RadioRequest) -> CatalogFuture<'_, RadioPage> {
-        let radio_started = Arc::clone(&self.radio_started);
-        let release_radio = Arc::clone(&self.release_radio);
-        self.radio_calls.fetch_add(1, Ordering::AcqRel);
-        Box::pin(async move {
-            assert_eq!(request.limit, 24);
-            radio_started.notify_one();
-            release_radio.notified().await;
-            Ok(RadioPage {
-                tracks: (0..24)
-                    .map(|index| {
-                        Track::new(
-                            format!("blocked-radio-{index}"),
-                            format!("Blocked Radio {index}"),
-                            "ZeroBeat",
-                            180_000,
-                        )
-                    })
-                    .collect(),
-                continuation: None,
-            })
-        })
-    }
-
-    fn resolve_stream(
-        &self,
-        track_id: &str,
-        _quality: AudioQuality,
-    ) -> CatalogFuture<'_, ResolvedStream> {
-        let track_id = track_id.to_owned();
-        Box::pin(async move {
-            Ok(ResolvedStream::new(format!(
-                "https://stream.example/{track_id}"
-            )))
-        })
+        session_id: &str,
+        mode: QueueRepeatMode,
+    ) -> QueueFuture<'_, QueueSession> {
+        self.mutate(session_id, move |session| session.repeat_mode = mode)
     }
 }
 
 struct RecordingBackend(Arc<Mutex<Vec<String>>>);
+
+struct FailingDeck {
+    name: &'static str,
+    events: Arc<Mutex<Vec<String>>>,
+    loaded: String,
+    ended: Arc<AtomicBool>,
+}
+
+impl FailingDeck {
+    fn with_end_flag(
+        name: &'static str,
+        events: Arc<Mutex<Vec<String>>>,
+        ended: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            name,
+            events,
+            loaded: String::new(),
+            ended,
+        }
+    }
+}
+
+impl AudioBackend for FailingDeck {
+    fn load(&mut self, source: &StreamSource) -> Result<(), BackendError> {
+        let track = source.url.rsplit('/').next().unwrap_or_default();
+        if track == "video-456" {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{}:load:{track}:failed", self.name));
+            return Err(BackendError::Unavailable("incoming load failed".into()));
+        }
+        self.loaded = track.to_owned();
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{}:load:{track}", self.name));
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), BackendError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{}:play:{}", self.name, self.loaded));
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn set_volume(&mut self, _volume: f32) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), BackendError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{}:stop", self.name));
+        Ok(())
+    }
+
+    fn telemetry(&self) -> BackendTelemetry {
+        BackendTelemetry {
+            duration_ms: 60_000,
+            ended: self.ended.load(Ordering::Acquire),
+            ..BackendTelemetry::default()
+        }
+    }
+}
 
 struct AutoAdvanceBackend {
     events: Arc<Mutex<Vec<&'static str>>>,
@@ -1290,6 +1689,35 @@ struct BlockingLoadBackend {
     loaded: String,
     first_load_started: Arc<AtomicBool>,
     release_first_load: Arc<AtomicBool>,
+}
+
+struct BlockingIncomingBackend {
+    load_started: Arc<AtomicBool>,
+    release_load: Arc<AtomicBool>,
+}
+
+impl AudioBackend for BlockingIncomingBackend {
+    fn load(&mut self, source: &StreamSource) -> Result<(), BackendError> {
+        if source.url.ends_with("video-456") {
+            self.load_started.store(true, Ordering::Release);
+            while !self.release_load.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 impl AudioBackend for BlockingLoadBackend {
@@ -1331,6 +1759,7 @@ impl AudioBackend for RecordingBackend {
         let event = match source.url.rsplit('/').next() {
             Some("video-123") => "load:https://stream.example/tampar".to_owned(),
             Some("video-456") => "load:https://stream.example/sialan".to_owned(),
+            Some("video-789") => "load:https://stream.example/lampu".to_owned(),
             _ => format!("load:{}", source.url),
         };
         self.0.lock().unwrap().push(event);
