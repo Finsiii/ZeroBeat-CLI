@@ -207,7 +207,7 @@ constexpr double ZB_SILENCE_RMS_THRESHOLD_SQUARED = 0.00001;
 constexpr int64_t ZB_FFMPEG_PROBE_SIZE_BYTES = 64 * 1024;
 constexpr int64_t ZB_FFMPEG_MAX_ANALYZE_DURATION_US = 500 * 1000;
 constexpr int32_t ZB_FFMPEG_MAX_PROBE_PACKETS = 32;
-constexpr int64_t ZB_HTTP_RANGE_BYTES = 256 * 1024;
+constexpr int64_t ZB_HTTP_RANGE_BYTES = 60 * 1024;
 constexpr double ZB_TAU = 6.28318530717958647692;
 
 struct http_range_input {
@@ -219,6 +219,8 @@ struct http_range_input {
   int64_t chunk_start = -1;
   int64_t total_size = -1;
   int64_t response_start = -1;
+  int64_t response_total = -1;
+  bool total_size_from_url = false;
   std::string error;
   CURL *curl = nullptr;
   curl_slist *request_headers = nullptr;
@@ -261,7 +263,7 @@ size_t inspect_http_header(char *data, size_t size, size_t count,
   try {
     input->response_start =
         std::stoll(line.substr(range_start, dash - range_start));
-    input->total_size = std::stoll(line.substr(slash + 1));
+    input->response_total = std::stoll(line.substr(slash + 1));
   } catch (const std::exception &) {
     input->response_start = -1;
   }
@@ -287,6 +289,64 @@ curl_slist *parse_curl_headers(const std::string &serialized) {
   return headers;
 }
 
+int64_t content_length_from_url(const std::string &url) {
+  const auto query = url.find('?');
+  if (query == std::string::npos) {
+    return -1;
+  }
+  size_t offset = query + 1;
+  while (offset < url.size()) {
+    const auto end = url.find('&', offset);
+    const auto length =
+        end == std::string::npos ? url.size() - offset : end - offset;
+    constexpr const char *prefix = "clen=";
+    if (length > std::strlen(prefix) &&
+        url.compare(offset, std::strlen(prefix), prefix) == 0) {
+      const auto value = url.substr(offset + std::strlen(prefix),
+                                    length - std::strlen(prefix));
+      if (std::all_of(value.begin(), value.end(),
+                      [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+        try {
+          const auto parsed = std::stoll(value);
+          return parsed > 0 ? parsed : -1;
+        } catch (const std::exception &) {
+          return -1;
+        }
+      }
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    offset = end + 1;
+  }
+  return -1;
+}
+
+std::string url_with_range(const std::string &url, const std::string &range) {
+  const auto fragment = url.find('#');
+  const auto query_end = fragment == std::string::npos ? url.size() : fragment;
+  const auto query = url.find('?');
+  if (query == std::string::npos || query >= query_end) {
+    return url.substr(0, query_end) + "?range=" + range + url.substr(query_end);
+  }
+  size_t offset = query + 1;
+  while (offset < query_end) {
+    auto next = url.find('&', offset);
+    if (next == std::string::npos || next > query_end) {
+      next = query_end;
+    }
+    auto name_end = url.find('=', offset);
+    if (name_end == std::string::npos || name_end > next) {
+      name_end = next;
+    }
+    if (url.compare(offset, name_end - offset, "range") == 0) {
+      return url.substr(0, offset) + "range=" + range + url.substr(next);
+    }
+    offset = next + 1;
+  }
+  return url.substr(0, query_end) + "&range=" + range + url.substr(query_end);
+}
+
 bool fetch_http_range(http_range_input *input, int64_t start) {
   static std::once_flag curl_once;
   static CURLcode curl_init_result = CURLE_FAILED_INIT;
@@ -305,7 +365,6 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
       return false;
     }
     input->request_headers = parse_curl_headers(input->headers);
-    curl_easy_setopt(input->curl, CURLOPT_URL, input->url.c_str());
     curl_easy_setopt(input->curl, CURLOPT_HTTPHEADER, input->request_headers);
     curl_easy_setopt(input->curl, CURLOPT_USERAGENT, input->user_agent.c_str());
     curl_easy_setopt(input->curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -318,12 +377,21 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
     curl_easy_setopt(input->curl, CURLOPT_HEADERFUNCTION, inspect_http_header);
     curl_easy_setopt(input->curl, CURLOPT_HEADERDATA, input);
   }
-  const auto end = start + ZB_HTTP_RANGE_BYTES - 1;
+  const auto natural_end = start + ZB_HTTP_RANGE_BYTES - 1;
+  const auto end = input->total_size > 0
+                       ? std::min(natural_end, input->total_size - 1)
+                       : natural_end;
   const auto range = std::to_string(start) + "-" + std::to_string(end);
+  const auto ranged_url = input->total_size_from_url
+                              ? url_with_range(input->url, range)
+                              : input->url;
   input->chunk.clear();
   input->response_start = -1;
+  input->response_total = -1;
   input->error.clear();
-  curl_easy_setopt(input->curl, CURLOPT_RANGE, range.c_str());
+  curl_easy_setopt(input->curl, CURLOPT_RANGE,
+                   input->total_size_from_url ? nullptr : range.c_str());
+  curl_easy_setopt(input->curl, CURLOPT_URL, ranged_url.c_str());
   const auto result = curl_easy_perform(input->curl);
   long status = 0;
   curl_easy_getinfo(input->curl, CURLINFO_RESPONSE_CODE, &status);
@@ -332,16 +400,40 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
     input->error = curl_easy_strerror(result);
     return false;
   }
-  if (status != 206 && !(status == 200 && start == 0)) {
+  if (status != 206 &&
+      !(status == 200 && (start == 0 || input->total_size >= 0))) {
     input->error = "HTTP status " + std::to_string(status);
     return false;
   }
-  if (input->response_start >= 0 && input->response_start != start) {
-    input->error = "unexpected Content-Range offset";
-    return false;
+  if (status == 206) {
+    if (!input->total_size_from_url) {
+      if (input->response_start >= 0 && input->response_start != start) {
+        input->error = "unexpected Content-Range offset";
+        return false;
+      }
+      if (input->total_size >= 0 && input->response_total >= 0 &&
+          input->total_size != input->response_total) {
+        input->error = "HTTP content length changed";
+        return false;
+      }
+      if (input->total_size < 0) {
+        input->total_size = input->response_total;
+      }
+    }
   }
   if (input->chunk.empty()) {
     input->error = "empty HTTP range response";
+    return false;
+  }
+  const auto expected = end - start + 1;
+  if (static_cast<int64_t>(input->chunk.size()) > expected) {
+    input->error = "HTTP server ignored requested byte range";
+    return false;
+  }
+  if (input->total_size >= 0 &&
+      static_cast<int64_t>(input->chunk.size()) < expected &&
+      start + static_cast<int64_t>(input->chunk.size()) < input->total_size) {
+    input->error = "short HTTP range response";
     return false;
   }
   if (status == 200 && input->total_size < 0) {
@@ -807,6 +899,8 @@ void decode_file_worker(zb_engine *engine, std::string path, int64_t start_ms) {
       path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
   if (is_http) {
     http_input.url = path;
+    http_input.total_size = content_length_from_url(path);
+    http_input.total_size_from_url = http_input.total_size > 0;
     http_input.headers = engine->http_headers;
     http_input.user_agent = engine->http_user_agent;
     auto *io_buffer = static_cast<uint8_t *>(av_malloc(64 * 1024));

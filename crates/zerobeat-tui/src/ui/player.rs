@@ -22,18 +22,25 @@ pub fn render_player(frame: &mut Frame, area: Rect, app: &App) {
         zerobeat_protocol::PlaybackStatus::Failed => "!",
         _ => "■",
     };
-    let status = app
+    let mut status = app
         .playback()
         .error
         .as_deref()
-        .unwrap_or(match app.playback().status {
-            zerobeat_protocol::PlaybackStatus::Resolving => "Resolving stream…",
-            zerobeat_protocol::PlaybackStatus::Buffering => "Buffering…",
-            zerobeat_protocol::PlaybackStatus::Playing => "Space pause · ←/→ seek · n next",
-            zerobeat_protocol::PlaybackStatus::Paused => "Space resume · ←/→ seek · n next",
-            zerobeat_protocol::PlaybackStatus::Ended => "Playback ended",
-            _ => "",
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            match app.playback().status {
+                zerobeat_protocol::PlaybackStatus::Resolving => "Resolving stream…",
+                zerobeat_protocol::PlaybackStatus::Buffering => "Buffering…",
+                zerobeat_protocol::PlaybackStatus::Playing => "Space pause · ←/→ seek · n next",
+                zerobeat_protocol::PlaybackStatus::Paused => "Space resume · ←/→ seek · n next",
+                zerobeat_protocol::PlaybackStatus::Ended => "Playback ended",
+                _ => "",
+            }
+            .to_owned()
         });
+    if !app.playback().queue.is_empty() {
+        status.push_str(&format!(" · {} queued", app.playback().queue.len()));
+    }
     let player = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(

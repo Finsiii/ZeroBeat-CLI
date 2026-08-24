@@ -35,8 +35,39 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StorageError> {
             local_path TEXT
         );
 
-        PRAGMA user_version = 1;
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS lyrics (
+            track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+            synced INTEGER NOT NULL,
+            lines_json TEXT NOT NULL
+        );
+
         ",
     )?;
+    let has_thumbnail: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('tracks') WHERE name = 'thumbnail_url'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_thumbnail {
+        connection.execute("ALTER TABLE tracks ADD COLUMN thumbnail_url TEXT", [])?;
+    }
+    let has_download_error: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('downloads') WHERE name = 'error_text'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_download_error {
+        connection.execute("ALTER TABLE downloads ADD COLUMN error_text TEXT", [])?;
+    }
+    connection.pragma_update(None, "user_version", 5)?;
     Ok(())
 }

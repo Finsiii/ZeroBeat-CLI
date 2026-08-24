@@ -9,9 +9,13 @@ use zerobeat_core::Route;
 
 use crate::{App, theme};
 
-use super::{content::render_content, player::render_player};
+use super::{
+    content::{render_content, render_queue},
+    player::render_player,
+};
 
 const WIDE_LAYOUT_MIN_COLUMNS: u16 = 90;
+const QUEUE_SIDEBAR_MIN_COLUMNS: u16 = 118;
 
 pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(
@@ -29,6 +33,18 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_wide(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width >= QUEUE_SIDEBAR_MIN_COLUMNS && !app.queue_focused() {
+        let columns = Layout::horizontal([
+            Constraint::Length(24),
+            Constraint::Min(44),
+            Constraint::Length(30),
+        ])
+        .split(area);
+        render_sidebar(frame, columns[0], app.route());
+        render_content(frame, columns[1], app);
+        render_queue(frame, columns[2], app, false);
+        return;
+    }
     let columns = Layout::horizontal([Constraint::Length(24), Constraint::Min(30)]).split(area);
     render_sidebar(frame, columns[0], app.route());
     render_content(frame, columns[1], app);

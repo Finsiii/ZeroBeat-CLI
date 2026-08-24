@@ -1,5 +1,7 @@
 use tokio::sync::OnceCell;
-use zerobeat_catalog::{AudioQuality, CatalogFuture, MusicCatalog, ResolvedStream, SearchRequest};
+use zerobeat_catalog::{
+    AudioQuality, CatalogFuture, Lyrics, MusicCatalog, ResolvedStream, SearchRequest,
+};
 use zerobeat_core::Track;
 
 use crate::{ApiClient, ApiConfig, ApiError, client::catalog_error};
@@ -46,6 +48,17 @@ impl MusicCatalog for ApiCatalog {
                 .await
                 .map_err(catalog_error)?
                 .resolve_stream(&track_id, quality)
+                .await
+        })
+    }
+
+    fn lyrics(&self, track: &Track) -> CatalogFuture<'_, Option<Lyrics>> {
+        let track = track.clone();
+        Box::pin(async move {
+            self.client()
+                .await
+                .map_err(catalog_error)?
+                .lyrics(&track)
                 .await
         })
     }

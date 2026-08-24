@@ -2256,6 +2256,7 @@ dependencies = [
 name = "zerobeat-catalog"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "thiserror",
  "zerobeat-core",
 ]
@@ -2271,9 +2272,11 @@ dependencies = [
 name = "zerobeat-daemon"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "tempfile",
  "thiserror",
  "tokio",
+ "url",
  "zerobeat-api",
  "zerobeat-audio",
  "zerobeat-catalog",
@@ -2281,6 +2284,7 @@ dependencies = [
  "zerobeat-ipc",
  "zerobeat-protocol",
  "zerobeat-runtime",
+ "zerobeat-storage",
 ]
 
 [[package]]
@@ -2333,8 +2337,10 @@ name = "zerobeat-storage"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "zerobeat-catalog",
  "zerobeat-core",
 ]
 

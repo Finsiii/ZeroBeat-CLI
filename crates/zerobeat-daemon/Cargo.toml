@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 thiserror.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
+url.workspace = true
 zerobeat-api = { path = "../zerobeat-api" }
 zerobeat-audio = { path = "../zerobeat-audio" }
 zerobeat-core = { path = "../zerobeat-core" }
@@ -16,6 +18,7 @@ zerobeat-catalog = { path = "../zerobeat-catalog" }
 zerobeat-ipc = { path = "../zerobeat-ipc" }
 zerobeat-protocol = { path = "../zerobeat-protocol" }
 zerobeat-runtime = { path = "../zerobeat-runtime" }
+zerobeat-storage = { path = "../zerobeat-storage" }
 
 [dev-dependencies]
 tempfile = "3"

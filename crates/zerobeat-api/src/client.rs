@@ -7,7 +7,8 @@ use reqwest::{RequestBuilder, StatusCode};
 use tokio::sync::Mutex;
 use url::form_urlencoded;
 use zerobeat_catalog::{
-    AudioQuality, CatalogError, CatalogFuture, MusicCatalog, ResolvedStream, SearchRequest,
+    AudioQuality, CatalogError, CatalogFuture, Lyrics, LyricsLine, MusicCatalog, ResolvedStream,
+    SearchRequest,
 };
 use zerobeat_core::Track;
 use zerobeat_security::{DeviceIdentity, IdentityStore, RequestToSign};
@@ -15,8 +16,8 @@ use zerobeat_security::{DeviceIdentity, IdentityStore, RequestToSign};
 use crate::{
     ApiConfig, ApiError,
     models::{
-        ChallengeRequest, ChallengeResponse, ProvisionRequest, ProvisionResponse, ResolveResponse,
-        SearchResponse, SearchTrack,
+        ChallengeRequest, ChallengeResponse, LyricsResponse, ProvisionRequest, ProvisionResponse,
+        ResolveResponse, SearchResponse, SearchTrack,
     },
 };
 
@@ -117,6 +118,41 @@ impl ApiClient {
         Ok(stream)
     }
 
+    async fn lyrics_for(&self, track: &Track) -> Result<Option<Lyrics>, ApiError> {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("title", &track.title)
+            .append_pair("artist", &track.artist)
+            .append_pair("durationSeconds", &(track.duration_ms / 1_000).to_string())
+            .finish();
+        let response = match self
+            .send_signed_get("/v1/lyrics/sources/lookup", &query)
+            .await
+        {
+            Ok(response) => response,
+            Err(ApiError::Rejected { status: 404, .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let response: LyricsResponse = parse_json(response)?;
+        let Some(source) = response.source.filter(|_| response.found) else {
+            return Ok(None);
+        };
+        let lines = source
+            .lines
+            .into_iter()
+            .filter(|line| !line.words.trim().is_empty())
+            .map(|line| LyricsLine {
+                start_ms: line.start_time_ms.parse().ok(),
+                words: line.words,
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        let synced = !source.sync_type.eq_ignore_ascii_case("unsynced")
+            && lines.iter().any(|line| line.start_ms.is_some());
+        Ok(Some(Lyrics { synced, lines }))
+    }
+
     async fn send_signed_get(&self, path: &str, raw_query: &str) -> Result<Vec<u8>, ApiError> {
         let host = self
             .config
@@ -190,6 +226,11 @@ impl MusicCatalog for ApiClient {
                 .await
                 .map_err(catalog_error)
         })
+    }
+
+    fn lyrics(&self, track: &Track) -> CatalogFuture<'_, Option<Lyrics>> {
+        let track = track.clone();
+        Box::pin(async move { self.lyrics_for(&track).await.map_err(catalog_error) })
     }
 }
 

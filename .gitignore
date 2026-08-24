@@ -1,4 +1,6 @@
 /target/
+.codex/
+AGENTS.md
 *.db
 *.db-shm
 *.db-wal

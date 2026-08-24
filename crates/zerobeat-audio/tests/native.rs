@@ -33,6 +33,7 @@ fn native_engine_sends_stream_specific_http_headers() {
         let mut request = [0_u8; 4096];
         let read = connection.read(&mut request).unwrap();
         let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+        assert!(request.starts_with("get /audio.wav http/1.1\r\n"));
         assert!(request.contains("user-agent: zerobeat-native-test"));
         assert!(request.contains("referer: https://music.youtube.com/"));
         let body = silent_wav(1_000);
@@ -44,15 +45,22 @@ fn native_engine_sends_stream_specific_http_headers() {
             write!(connection, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             return false;
         }
+        let end = request
+            .lines()
+            .find_map(|line| line.strip_prefix("range: bytes=0-"))
+            .and_then(|end| end.trim().parse::<usize>().ok())
+            .unwrap()
+            .min(body.len() - 1);
+        let chunk = &body[..=end];
         write!(
             connection,
             "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
-            body.len(),
-            body.len() - 1,
+            chunk.len(),
+            end,
             body.len(),
         )
         .unwrap();
-        connection.write_all(&body).unwrap();
+        connection.write_all(chunk).unwrap();
         true
     });
     let mut engine = NativeEngine::new().unwrap();

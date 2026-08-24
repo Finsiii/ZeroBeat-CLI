@@ -42,4 +42,5 @@ pub struct Download {
     pub track: Track,
     pub state: DownloadState,
     pub local_path: Option<String>,
+    pub error: Option<String>,
 }

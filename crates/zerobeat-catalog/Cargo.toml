@@ -7,5 +7,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
 thiserror.workspace = true
 zerobeat-core = { path = "../zerobeat-core" }

@@ -15,6 +15,12 @@ fn command_round_trips_without_losing_payload() {
         ClientCommand::SubmitSearch,
         ClientCommand::SelectNext,
         ClientCommand::PlaySelected,
+        ClientCommand::PlayTrack(Track::new("video-1", "Tampar", "Juicy Luicy", 245_000)),
+        ClientCommand::QueueTrack(Track::new("video-1", "Tampar", "Juicy Luicy", 245_000)),
+        ClientCommand::ToggleLike(Track::new("video-1", "Tampar", "Juicy Luicy", 245_000)),
+        ClientCommand::DownloadTrack(Track::new("video-1", "Tampar", "Juicy Luicy", 245_000)),
+        ClientCommand::ToggleLyrics,
+        ClientCommand::SetCrossfadeSeconds(8),
         ClientCommand::TogglePlayback,
         ClientCommand::NextTrack,
         ClientCommand::RequestSnapshot,
@@ -51,7 +57,11 @@ fn snapshot_event_round_trips_with_guest_navigation_state() {
             volume_percent: 80,
             error: None,
             request_id: 1,
+            queue: vec![Track::new("video-2", "Sialan", "Juicy Luicy", 242_000)],
         },
+        library: Default::default(),
+        lyrics: Default::default(),
+        settings: Default::default(),
     }));
 
     let bytes = encode(&event).expect("encode event");

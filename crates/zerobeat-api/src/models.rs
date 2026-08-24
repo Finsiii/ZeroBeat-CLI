@@ -78,3 +78,26 @@ pub(crate) struct ResolveFormat {
     #[serde(default)]
     pub http_headers: BTreeMap<String, String>,
 }
+
+#[derive(Deserialize)]
+pub(crate) struct LyricsResponse {
+    pub found: bool,
+    pub source: Option<LyricsSource>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LyricsSource {
+    #[serde(default)]
+    pub sync_type: String,
+    #[serde(default)]
+    pub lines: Vec<LyricsLine>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LyricsLine {
+    #[serde(default)]
+    pub start_time_ms: String,
+    pub words: String,
+}

@@ -1,5 +1,11 @@
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
 use zerobeat_audio::{
-    AudioBackend, BackendError, CrossfadeCurve, Player, PlayerState, QueueItem, StreamSource,
+    AudioBackend, BackendError, BackendTelemetry, CrossfadeCurve, DualDeck, Player, PlayerState,
+    QueueItem, StreamSource,
 };
 use zerobeat_core::Track;
 
@@ -57,9 +63,84 @@ fn pause_and_resume_do_not_reload_the_stream() {
     );
 }
 
+#[test]
+fn dual_deck_crossfade_prebuffers_incoming_before_releasing_outgoing() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let first = SharedRecordingBackend::new("a", Arc::clone(&events));
+    let second = SharedRecordingBackend::new("b", Arc::clone(&events));
+    let mut mixer = DualDeck::new(first, second);
+    mixer.load(&StreamSource::new("first")).unwrap();
+    mixer.play().unwrap();
+
+    mixer
+        .transition_to(&StreamSource::new("second"), Duration::from_millis(20))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+
+    let events = events.lock().unwrap();
+    let incoming_load = event_index(&events, "b:load:second");
+    let incoming_play = event_index(&events, "b:play");
+    let outgoing_stop = events.iter().rposition(|event| event == "a:stop").unwrap();
+    assert!(incoming_load < incoming_play);
+    assert!(incoming_play < outgoing_stop);
+    assert_eq!(mixer.telemetry().position_ms, 2_000);
+}
+
 #[derive(Default)]
 struct RecordingBackend {
     events: Vec<String>,
+}
+
+struct SharedRecordingBackend {
+    name: &'static str,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl SharedRecordingBackend {
+    fn new(name: &'static str, events: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { name, events }
+    }
+
+    fn record(&self, event: impl Into<String>) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{}:{}", self.name, event.into()));
+    }
+}
+
+impl AudioBackend for SharedRecordingBackend {
+    fn load(&mut self, source: &StreamSource) -> Result<(), BackendError> {
+        self.record(format!("load:{}", source.url));
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), BackendError> {
+        self.record("play");
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        self.record("pause");
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), BackendError> {
+        self.record("stop");
+        Ok(())
+    }
+
+    fn set_volume(&mut self, volume: f32) -> Result<(), BackendError> {
+        self.record(format!("volume:{volume:.3}"));
+        Ok(())
+    }
+
+    fn telemetry(&self) -> BackendTelemetry {
+        BackendTelemetry {
+            position_ms: if self.name == "a" { 1_000 } else { 2_000 },
+            ..BackendTelemetry::default()
+        }
+    }
 }
 
 impl AudioBackend for RecordingBackend {
@@ -90,4 +171,11 @@ fn item(id: &str) -> QueueItem {
 
 fn assert_close(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");
+}
+
+fn event_index(events: &[String], expected: &str) -> usize {
+    events
+        .iter()
+        .position(|event| event == expected)
+        .unwrap_or_else(|| panic!("missing {expected} in {events:?}"))
 }
