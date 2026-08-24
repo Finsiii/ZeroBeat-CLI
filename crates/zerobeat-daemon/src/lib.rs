@@ -1,4 +1,5 @@
 mod download;
+mod endless_queue;
 mod error;
 mod server;
 

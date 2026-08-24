@@ -7,8 +7,8 @@ use reqwest::{RequestBuilder, StatusCode};
 use tokio::sync::Mutex;
 use url::form_urlencoded;
 use zerobeat_catalog::{
-    AudioQuality, CatalogError, CatalogFuture, Lyrics, LyricsLine, MusicCatalog, ResolvedStream,
-    SearchRequest,
+    AudioQuality, CatalogError, CatalogFuture, Lyrics, LyricsLine, MusicCatalog, RadioPage,
+    RadioRequest, ResolvedStream, SearchRequest,
 };
 use zerobeat_core::Track;
 use zerobeat_security::{DeviceIdentity, IdentityStore, RequestToSign};
@@ -17,7 +17,7 @@ use crate::{
     ApiConfig, ApiError,
     models::{
         ChallengeRequest, ChallengeResponse, LyricsResponse, ProvisionRequest, ProvisionResponse,
-        ResolveResponse, SearchResponse, SearchTrack,
+        RadioResponse, ResolveResponse, SearchResponse, SearchTrack,
     },
 };
 
@@ -89,6 +89,25 @@ impl ApiClient {
         let response = self.send_signed_get("/v1/app/search/songs", &query).await?;
         let response: SearchResponse = parse_json(response)?;
         Ok(response.items.into_iter().map(track_from_api).collect())
+    }
+
+    async fn radio(&self, request: RadioRequest) -> Result<RadioPage, ApiError> {
+        let query = {
+            let mut serializer = form_urlencoded::Serializer::new(String::new());
+            if let Some(continuation) = request.continuation {
+                serializer.append_pair("continuation", &continuation);
+            } else {
+                serializer.append_pair("video_id", &request.seed_track_id);
+            }
+            serializer.append_pair("limit", &request.limit.to_string());
+            serializer.finish()
+        };
+        let response = self.send_signed_get("/v1/app/next", &query).await?;
+        let response: RadioResponse = parse_json(response)?;
+        Ok(RadioPage {
+            tracks: response.items.into_iter().map(track_from_api).collect(),
+            continuation: response.continuation,
+        })
     }
 
     async fn resolve(
@@ -213,6 +232,10 @@ impl ApiClient {
 impl MusicCatalog for ApiClient {
     fn search_songs(&self, request: SearchRequest) -> CatalogFuture<'_, Vec<Track>> {
         Box::pin(async move { self.search(request).await.map_err(catalog_error) })
+    }
+
+    fn radio_tracks(&self, request: RadioRequest) -> CatalogFuture<'_, RadioPage> {
+        Box::pin(async move { self.radio(request).await.map_err(catalog_error) })
     }
 
     fn resolve_stream(

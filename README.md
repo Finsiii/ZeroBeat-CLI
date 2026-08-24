@@ -6,7 +6,7 @@ A modern, Linux-first ZeroBeat player for the terminal. It combines a responsive
 
 - Home, search, library, downloads, queue, lyrics, and settings
 - fast streamed playback with prebuffering, seek, volume, and telemetry
-- automatic queue progression and configurable equal-power crossfade
+- endless 12-track radio queue and configurable equal-power crossfade
 - synced lyrics with offline cache
 - local likes, recent plays, settings, and private offline downloads
 - guest mode with no account required
@@ -29,7 +29,7 @@ The TUI starts the per-user daemon automatically. User state is stored under `$X
 
 ## Controls
 
-`1`–`5` switch pages, `/` focuses search, `Enter` plays, `a` queues, `d` downloads, `l` likes, `y` opens lyrics, and `u` opens the queue. Use `Space` to pause, `n` for next, arrow keys to seek, `-`/`+` for volume, `[`/`]` for crossfade, and `q` to quit.
+`1`–`8` open sidebar actions, `/` focuses search, `Enter` plays, `a` queues, `d` downloads, `l` likes, `y` opens lyrics, and `u` opens the queue. Use `Space` to pause, `p`/`n` for previous/next, `s` for shuffle, `r` for repeat, arrow keys to seek, `-`/`+` for volume, and `q` to quit.
 
 ## License
 

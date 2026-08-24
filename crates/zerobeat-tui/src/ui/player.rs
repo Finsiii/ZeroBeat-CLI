@@ -83,7 +83,7 @@ pub fn render_player(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap
         frame,
         rows[2],
         Line::styled(
-            spectrum_text(&app.playback().spectrum),
+            spectrum_text(app.spectrum(), rows[2].width),
             Style::default().fg(theme::ACCENT),
         ),
     );
@@ -93,7 +93,7 @@ pub fn render_player(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap
         frame,
         rows[5],
         Line::styled(
-            "click controls  ·  scroll volume  ·  Space play/pause  ·  ←/→ seek",
+            "/ search  ·  ↑/↓ browse  ·  Enter select  ·  ←/→ seek 10s  ·  q quit",
             Style::default().fg(theme::TEXT_MUTED),
         ),
     );
@@ -146,9 +146,9 @@ fn render_progress(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
 
 fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     let repeat = match app.playback().repeat_mode {
-        RepeatMode::Off => "REPEAT OFF",
-        RepeatMode::All => "REPEAT ALL",
-        RepeatMode::One => "REPEAT ONE",
+        RepeatMode::Off => "Repeat Off",
+        RepeatMode::All => "Repeat All",
+        RepeatMode::One => "Repeat One",
     };
     let playing = app.playback().status == PlaybackStatus::Playing;
     let liked = app
@@ -157,42 +157,66 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
         .as_ref()
         .is_some_and(|track| app.library().liked.iter().any(|liked| liked.id == track.id));
     let volume = if app.playback().muted {
-        "MUTED".to_owned()
+        "Muted".to_owned()
     } else {
-        format!("VOL {}%", app.playback().volume_percent)
+        format!("Vol {}%", app.playback().volume_percent)
     };
+    let wide = area.width >= 112;
     let controls = [
         (
             MouseTarget::Shuffle,
-            "SHUFFLE".to_owned(),
+            if wide { "(s) Shuffle" } else { "(s) Shuf" }.to_owned(),
             app.playback().shuffle,
         ),
-        (MouseTarget::Previous, "◀◀".to_owned(), false),
+        (MouseTarget::Previous, "(p) Prev".to_owned(), false),
         (
             MouseTarget::PlayPause,
-            if playing { "Ⅱ" } else { "▶" }.to_owned(),
+            if wide {
+                if playing {
+                    "(Space) Pause"
+                } else {
+                    "(Space) Play"
+                }
+            } else if playing {
+                "(Space) Ⅱ"
+            } else {
+                "(Space) ▶"
+            }
+            .to_owned(),
             true,
         ),
-        (MouseTarget::Next, "▶▶".to_owned(), false),
+        (MouseTarget::Next, "(n) Next".to_owned(), false),
         (
             MouseTarget::Repeat,
-            repeat.to_owned(),
+            if wide {
+                format!("(r) {repeat}")
+            } else {
+                format!("(r) {}", repeat.trim_start_matches("Repeat "))
+            },
             app.playback().repeat_mode != RepeatMode::Off,
         ),
         (
             MouseTarget::Like,
-            if liked { "♥" } else { "♡" }.to_owned(),
+            if liked { "(l) ♥" } else { "(l) ♡" }.to_owned(),
             liked,
         ),
         (
             MouseTarget::Lyrics,
-            "LYRICS".to_owned(),
+            if wide { "(y) Lyrics" } else { "(y) Lyr" }.to_owned(),
             app.lyrics().visible,
         ),
-        (MouseTarget::Queue, "QUEUE".to_owned(), app.queue_focused()),
-        (MouseTarget::Mute, volume, app.playback().muted),
+        (
+            MouseTarget::Queue,
+            if wide { "(u) Queue" } else { "(u) Q" }.to_owned(),
+            app.queue_focused(),
+        ),
+        (
+            MouseTarget::Mute,
+            format!("(m) {volume}"),
+            app.playback().muted,
+        ),
     ];
-    let gap = 3_u16;
+    let gap = if wide { 2_u16 } else { 1_u16 };
     let content_width = controls.iter().fold(0_u16, |width, (_, label, _)| {
         width.saturating_add(label.chars().count() as u16)
     });
@@ -244,12 +268,25 @@ fn centered(frame: &mut Frame, area: Rect, line: Line<'_>) {
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
-fn spectrum_text(spectrum: &[u8; 24]) -> String {
+fn spectrum_text(spectrum: &[u8; 24], available_width: u16) -> String {
     const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    spectrum
-        .iter()
-        .map(|value| LEVELS[usize::from(*value).min(100) * (LEVELS.len() - 1) / 100])
-        .flat_map(|level| [level, ' '])
+    let width = usize::from(available_width.saturating_sub(8).clamp(32, 72));
+    if spectrum.iter().all(|value| *value == 0) {
+        return "─".repeat(width);
+    }
+    let last = spectrum.len() - 1;
+    (0..width)
+        .map(|index| {
+            let scaled = index * last;
+            let left = scaled / width.saturating_sub(1);
+            let right = (left + 1).min(last);
+            let fraction = scaled % width.saturating_sub(1);
+            let left_value = usize::from(spectrum[left].min(100));
+            let right_value = usize::from(spectrum[right].min(100));
+            let value = (left_value * (width - 1 - fraction) + right_value * fraction)
+                / width.saturating_sub(1);
+            LEVELS[value * (LEVELS.len() - 1) / 100]
+        })
         .collect()
 }
 

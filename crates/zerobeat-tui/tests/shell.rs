@@ -49,7 +49,7 @@ fn navigation_and_search_keys_produce_daemon_commands() {
     let mut app = App::default();
 
     assert_eq!(
-        app.handle_key(key(KeyCode::Char('2'))),
+        app.handle_key(key(KeyCode::Char('5'))),
         Some(ClientCommand::Navigate(Route::Search))
     );
     assert_eq!(
@@ -58,6 +58,50 @@ fn navigation_and_search_keys_produce_daemon_commands() {
     );
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.handle_key(key(KeyCode::Esc)), Some(ClientCommand::Back));
+}
+
+#[test]
+fn submitted_search_releases_space_for_global_playback() {
+    let mut app = App::default();
+    app.handle_key(key(KeyCode::Char('/')));
+    for character in "juicy luicy".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(ClientCommand::SubmitSearch)
+    );
+    assert!(!app.search_focused());
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char(' '))),
+        Some(ClientCommand::TogglePlayback)
+    );
+}
+
+#[test]
+fn navigation_closes_local_overlays_and_stale_search_focus() {
+    let mut app = App::default();
+    app.handle_key(key(KeyCode::Char('u')));
+    assert!(app.queue_focused());
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('4'))),
+        Some(ClientCommand::Navigate(Route::Home))
+    );
+    assert!(!app.queue_focused());
+
+    app.handle_key(key(KeyCode::Char('/')));
+    assert!(app.search_focused());
+    let (_, hits) = render_screen_with_hits(140, 38, &app);
+    let library = hits
+        .region(MouseTarget::Navigation(Route::Library))
+        .unwrap();
+    assert_eq!(
+        app.handle_mouse(click(library.x, library.y), &hits),
+        Some(ClientCommand::Navigate(Route::Library))
+    );
+    assert!(!app.search_focused());
 }
 
 #[test]
@@ -122,15 +166,17 @@ fn player_bar_shows_current_track_and_transport_state() {
         ..AppSnapshot::default()
     };
 
-    let screen = render_screen(100, 28, &App::new(snapshot));
+    let screen = render_screen(140, 28, &App::new(snapshot));
 
     assert!(screen.contains("Tampar"));
     assert!(screen.contains("Juicy Luicy"));
     assert!(screen.contains("01:01"));
     assert!(screen.contains("-02:22"));
-    assert!(screen.contains("SHUFFLE"));
-    assert!(screen.contains("REPEAT OFF"));
+    assert!(screen.contains("(s) Shuffle"));
+    assert!(screen.contains("(r) Repeat Off"));
+    assert!(screen.contains("(Space) Pause"));
     assert!(screen.contains("75%"));
+    assert!(!screen.contains("click controls"));
 }
 
 #[test]
@@ -160,6 +206,7 @@ fn studio_deck_renders_real_spectrum_and_library_first_sidebar_without_capsules(
         assert!(screen.contains(expected), "missing {expected:?}");
     }
     assert!(screen.contains('█') || screen.contains('▆'));
+    assert!(!screen.contains("▁ ▁"));
     assert!(!screen.contains("ONLINE"));
     assert!(!screen.contains("[Online]"));
     for target in [
@@ -176,6 +223,82 @@ fn studio_deck_renders_real_spectrum_and_library_first_sidebar_without_capsules(
     ] {
         assert!(hits.region(target).is_some(), "missing {target:?}");
     }
+}
+
+#[test]
+fn sidebar_numbers_match_keyboard_navigation_and_sections_are_dividers() {
+    let screen = render_screen(140, 38, &App::default());
+
+    for expected in [
+        "1  Liked Songs",
+        "2  Recently Played",
+        "3  Downloads",
+        "4  Home",
+        "5  Search",
+        "6  Queue",
+        "7  Lyrics",
+        "8  Settings",
+        "─ DISCOVER",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}");
+    }
+
+    let mut app = App::default();
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('1'))),
+        Some(ClientCommand::Navigate(Route::Library))
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('3'))),
+        Some(ClientCommand::Navigate(Route::Downloads))
+    );
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('8'))),
+        Some(ClientCommand::Navigate(Route::Settings))
+    );
+}
+
+#[test]
+fn paused_visualizer_is_a_continuous_line_instead_of_dotted_blocks() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Paused;
+    snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000));
+
+    let screen = render_screen(140, 28, &App::new(snapshot));
+
+    assert!(screen.contains("────────"));
+    assert!(!screen.contains("▁ ▁"));
+}
+
+#[test]
+fn spectrum_smoothing_attacks_releases_and_resets() {
+    let track = Track::new("one", "Tampar", "Juicy Luicy", 203_000);
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.current = Some(track.clone());
+    let mut app = App::new(snapshot.clone());
+
+    snapshot.playback.spectrum = [100; 24];
+    app.replace_snapshot(snapshot.clone());
+    assert_eq!(app.spectrum()[0], 75);
+
+    snapshot.playback.spectrum = [0; 24];
+    app.replace_snapshot(snapshot.clone());
+    assert_eq!(app.spectrum()[0], 60);
+
+    snapshot.playback.status = PlaybackStatus::Paused;
+    app.replace_snapshot(snapshot.clone());
+    assert_eq!(app.spectrum(), &[0; 24]);
+
+    snapshot.playback.status = PlaybackStatus::Idle;
+    app.replace_snapshot(snapshot.clone());
+    assert_eq!(app.spectrum(), &[0; 24]);
+
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.current = None;
+    snapshot.playback.spectrum = [100; 24];
+    app.replace_snapshot(snapshot);
+    assert_eq!(app.spectrum(), &[0; 24]);
 }
 
 #[test]

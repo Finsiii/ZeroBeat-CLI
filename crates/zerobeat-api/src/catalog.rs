@@ -1,6 +1,7 @@
 use tokio::sync::OnceCell;
 use zerobeat_catalog::{
-    AudioQuality, CatalogFuture, Lyrics, MusicCatalog, ResolvedStream, SearchRequest,
+    AudioQuality, CatalogFuture, Lyrics, MusicCatalog, RadioPage, RadioRequest, ResolvedStream,
+    SearchRequest,
 };
 use zerobeat_core::Track;
 
@@ -33,6 +34,16 @@ impl MusicCatalog for ApiCatalog {
                 .await
                 .map_err(catalog_error)?
                 .search_songs(request)
+                .await
+        })
+    }
+
+    fn radio_tracks(&self, request: RadioRequest) -> CatalogFuture<'_, RadioPage> {
+        Box::pin(async move {
+            self.client()
+                .await
+                .map_err(catalog_error)?
+                .radio_tracks(request)
                 .await
         })
     }

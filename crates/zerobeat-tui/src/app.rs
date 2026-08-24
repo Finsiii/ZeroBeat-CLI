@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use zerobeat_core::Route;
 use zerobeat_protocol::{
-    AppSnapshot, ClientCommand, PlaybackSnapshot, PlaybackStatus, SearchSnapshot, SearchStatus,
+    AppSnapshot, ClientCommand, PlaybackSnapshot, PlaybackStatus, SPECTRUM_BAND_COUNT,
+    SearchSnapshot, SearchStatus,
 };
 
 #[derive(Default)]
@@ -14,17 +15,32 @@ pub struct App {
     downloads_selected: usize,
     queue_focused: bool,
     queue_selected: usize,
+    spectrum_smoothed: [u8; SPECTRUM_BAND_COUNT],
+    spectrum_initialized: bool,
+    spectrum_track_id: Option<String>,
 }
 
 impl App {
     pub fn new(snapshot: AppSnapshot) -> Self {
-        Self {
+        let mut app = Self {
             snapshot,
             ..Self::default()
+        };
+        app.spectrum_track_id = app
+            .snapshot
+            .playback
+            .current
+            .as_ref()
+            .map(|track| track.id.clone());
+        if app.spectrum_is_active() {
+            app.spectrum_smoothed = app.snapshot.playback.spectrum;
+            app.spectrum_initialized = true;
         }
+        app
     }
 
     pub fn replace_snapshot(&mut self, snapshot: AppSnapshot) {
+        self.update_spectrum(&snapshot.playback);
         self.queue_selected = self
             .queue_selected
             .min(snapshot.playback.queue.len().saturating_sub(1));
@@ -49,6 +65,10 @@ impl App {
 
     pub fn playback(&self) -> &PlaybackSnapshot {
         &self.snapshot.playback
+    }
+
+    pub fn spectrum(&self) -> &[u8; SPECTRUM_BAND_COUNT] {
+        &self.spectrum_smoothed
     }
 
     pub fn library(&self) -> &zerobeat_protocol::LibrarySnapshot {
@@ -102,6 +122,9 @@ impl App {
     }
 
     pub fn open(&mut self, route: Route) {
+        self.search_focused = false;
+        self.queue_focused = false;
+        self.snapshot.lyrics.visible = false;
         self.snapshot.navigation.open(route);
     }
 
@@ -111,24 +134,27 @@ impl App {
         }
 
         match event.code {
-            KeyCode::Char('/') => {
-                self.open(Route::Search);
-                self.search_focused = true;
-                Some(ClientCommand::Navigate(Route::Search))
-            }
-            KeyCode::Char('1') => self.navigate(Route::Home),
-            KeyCode::Char('2') => {
-                self.search_focused = true;
-                self.navigate(Route::Search)
-            }
-            KeyCode::Char('3') => self.navigate(Route::Library),
-            KeyCode::Char('4') => self.navigate(Route::Downloads),
-            KeyCode::Char('5') => self.navigate(Route::Settings),
+            KeyCode::Char('/') => self.navigate_search(),
+            KeyCode::Char('1') => self.navigate(Route::Library),
+            KeyCode::Char('2') => self.navigate(Route::Home),
+            KeyCode::Char('3') => self.navigate(Route::Downloads),
+            KeyCode::Char('4') => self.navigate(Route::Home),
+            KeyCode::Char('5') => self.navigate_search(),
+            KeyCode::Char('6') => self.toggle_queue(),
+            KeyCode::Char('7') => self.toggle_lyrics(),
+            KeyCode::Char('8') => self.navigate(Route::Settings),
             KeyCode::Char('q') => {
                 self.should_quit = true;
                 None
             }
             KeyCode::Esc => {
+                if self.queue_focused {
+                    self.queue_focused = false;
+                    return None;
+                }
+                if self.lyrics().visible {
+                    return Some(ClientCommand::ToggleLyrics);
+                }
                 self.snapshot.navigation.back();
                 Some(ClientCommand::Back)
             }
@@ -149,11 +175,8 @@ impl App {
             KeyCode::Char('a') => self.selected_track().map(ClientCommand::QueueTrack),
             KeyCode::Char('l') => self.selected_track().map(ClientCommand::ToggleLike),
             KeyCode::Char('d') => self.selected_track().map(ClientCommand::DownloadTrack),
-            KeyCode::Char('y') => Some(ClientCommand::ToggleLyrics),
-            KeyCode::Char('u') => {
-                self.queue_focused = !self.queue_focused;
-                None
-            }
+            KeyCode::Char('y') => self.toggle_lyrics(),
+            KeyCode::Char('u') => self.toggle_queue(),
             KeyCode::Char('[') if self.route() == Route::Settings => {
                 Some(ClientCommand::SetCrossfadeSeconds(
                     self.settings().crossfade_seconds.saturating_sub(1),
@@ -218,16 +241,9 @@ impl App {
         }
         let target = hits.target_at(event.column, event.row)?;
         match target {
-            crate::MouseTarget::Navigation(Route::Search) => {
-                self.search_focused = true;
-                self.navigate(Route::Search)
-            }
+            crate::MouseTarget::Navigation(Route::Search) => self.navigate_search(),
             crate::MouseTarget::Navigation(route) => self.navigate(route),
-            crate::MouseTarget::SearchInput => {
-                self.open(Route::Search);
-                self.search_focused = true;
-                Some(ClientCommand::Navigate(Route::Search))
-            }
+            crate::MouseTarget::SearchInput => self.navigate_search(),
             crate::MouseTarget::ContentTrack(index) => {
                 self.select_index(index);
                 self.track_at(index).map(ClientCommand::PlayTrack)
@@ -257,12 +273,9 @@ impl App {
                 .current
                 .clone()
                 .map(ClientCommand::ToggleLike),
-            crate::MouseTarget::Lyrics => Some(ClientCommand::ToggleLyrics),
+            crate::MouseTarget::Lyrics => self.toggle_lyrics(),
             crate::MouseTarget::Mute => Some(ClientCommand::ToggleMute),
-            crate::MouseTarget::Queue => {
-                self.queue_focused = !self.queue_focused;
-                None
-            }
+            crate::MouseTarget::Queue => self.toggle_queue(),
             crate::MouseTarget::Player => None,
         }
     }
@@ -367,6 +380,31 @@ impl App {
         Some(ClientCommand::Navigate(route))
     }
 
+    fn navigate_search(&mut self) -> Option<ClientCommand> {
+        let command = self.navigate(Route::Search);
+        self.search_focused = true;
+        command
+    }
+
+    fn toggle_queue(&mut self) -> Option<ClientCommand> {
+        if self.queue_focused {
+            self.queue_focused = false;
+            return None;
+        }
+        self.queue_focused = true;
+        if self.lyrics().visible {
+            self.snapshot.lyrics.visible = false;
+            Some(ClientCommand::ToggleLyrics)
+        } else {
+            None
+        }
+    }
+
+    fn toggle_lyrics(&mut self) -> Option<ClientCommand> {
+        self.queue_focused = false;
+        Some(ClientCommand::ToggleLyrics)
+    }
+
     fn handle_search_key(&mut self, code: KeyCode) -> Option<ClientCommand> {
         match code {
             KeyCode::Esc => {
@@ -391,5 +429,46 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    fn spectrum_is_active(&self) -> bool {
+        self.snapshot.playback.status == PlaybackStatus::Playing
+            && self.snapshot.playback.current.is_some()
+    }
+
+    fn update_spectrum(&mut self, playback: &PlaybackSnapshot) {
+        let track_id = playback.current.as_ref().map(|track| track.id.clone());
+        let active = playback.status == PlaybackStatus::Playing && track_id.is_some();
+        if !active {
+            self.spectrum_smoothed = [0; SPECTRUM_BAND_COUNT];
+            self.spectrum_initialized = false;
+            self.spectrum_track_id = track_id;
+            return;
+        }
+
+        let track_changed = self.spectrum_track_id != track_id;
+        if track_changed || !self.spectrum_initialized {
+            self.spectrum_smoothed = playback.spectrum;
+            self.spectrum_initialized = true;
+        } else {
+            for (smoothed, target) in self
+                .spectrum_smoothed
+                .iter_mut()
+                .zip(playback.spectrum.iter().copied())
+            {
+                *smoothed = smooth_band(*smoothed, target.min(100));
+            }
+        }
+        self.spectrum_track_id = track_id;
+    }
+}
+
+fn smooth_band(current: u8, target: u8) -> u8 {
+    if target > current {
+        let delta = u16::from(target - current);
+        current.saturating_add((delta * 3).div_ceil(4) as u8)
+    } else {
+        let delta = u16::from(current - target);
+        current.saturating_sub(delta.div_ceil(5) as u8)
     }
 }

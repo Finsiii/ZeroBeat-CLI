@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -25,7 +26,11 @@ use zerobeat_protocol::{
 };
 use zerobeat_storage::{Database, DownloadState};
 
-use crate::{DaemonError, download::spawn_download};
+use crate::{
+    DaemonError,
+    download::spawn_download,
+    endless_queue::{EndlessQueue, MAX_VISIBLE_QUEUE},
+};
 
 pub struct DaemonServer {
     listener: UnixListener,
@@ -44,6 +49,7 @@ type SharedStorage = Arc<StdMutex<Database>>;
 struct PlaybackCoordinator {
     state: Arc<Mutex<AppSnapshot>>,
     generation: Arc<AtomicU64>,
+    endless_queue: Arc<StdMutex<EndlessQueue>>,
 }
 
 const CROSSFADE_PREPARE_LEAD: Duration = Duration::from_secs(2);
@@ -106,6 +112,7 @@ impl DaemonServer {
             playback: PlaybackCoordinator {
                 state: Arc::new(Mutex::new(state)),
                 generation: Arc::new(AtomicU64::new(0)),
+                endless_queue: Arc::new(StdMutex::new(EndlessQueue::default())),
             },
             catalog: Arc::new(catalog),
             audio: Arc::new(StdMutex::new(Box::new(audio))),
@@ -233,11 +240,13 @@ async fn apply_command(
         ClientCommand::Navigate(route) => {
             let mut snapshot = state.lock().await;
             snapshot.navigation.open(route);
+            snapshot.lyrics.visible = false;
             (snapshot_event(snapshot.clone()), false)
         }
         ClientCommand::Back => {
             let mut snapshot = state.lock().await;
             snapshot.navigation.back();
+            snapshot.lyrics.visible = false;
             (snapshot_event(snapshot.clone()), false)
         }
         ClientCommand::UpdateSearch(query) => {
@@ -314,15 +323,16 @@ async fn apply_command(
             let Some(track) = snapshot.search.results.get(selected_index).cloned() else {
                 return (snapshot_event(snapshot.clone()), false);
             };
-            remember_current(&mut snapshot);
-            let request_id = prepare_track(&mut snapshot, playback_generation, &track);
-            snapshot.playback.queue = snapshot
+            let queue_candidates = snapshot
                 .search
                 .results
                 .iter()
                 .skip(selected_index + 1)
                 .cloned()
-                .collect();
+                .collect::<Vec<_>>();
+            remember_current(&mut snapshot);
+            let request_id = prepare_track(&mut snapshot, playback_generation, &track);
+            start_endless_queue(playback, &mut snapshot, &track, queue_candidates);
             let event = snapshot_event(snapshot.clone());
             drop(snapshot);
 
@@ -335,6 +345,7 @@ async fn apply_command(
                 Arc::clone(storage),
                 start,
             );
+            schedule_endless_refill(playback.clone(), Arc::clone(catalog));
             (event, false)
         }
         ClientCommand::QueueSelected => {
@@ -357,7 +368,14 @@ async fn apply_command(
                 .queue
                 .iter()
                 .any(|queued| queued.id == track.id);
-            if !is_current && !is_queued {
+            if !is_current && !is_queued && snapshot.playback.queue.len() < MAX_VISIBLE_QUEUE {
+                let reserved = playback
+                    .endless_queue
+                    .lock()
+                    .is_ok_and(|mut endless| endless.reserve(&track.id));
+                if !reserved {
+                    return (snapshot_event(snapshot.clone()), false);
+                }
                 snapshot.playback.queue.push(track);
             }
             (snapshot_event(snapshot.clone()), false)
@@ -372,8 +390,10 @@ async fn apply_command(
             } else {
                 PlaybackStart::Replace
             };
+            let queue_candidates = snapshot.playback.queue.clone();
             remember_current(&mut snapshot);
             let request_id = prepare_track(&mut snapshot, playback_generation, &track);
+            start_endless_queue(playback, &mut snapshot, &track, queue_candidates);
             let event = snapshot_event(snapshot.clone());
             drop(snapshot);
             spawn_playback(
@@ -385,6 +405,7 @@ async fn apply_command(
                 Arc::clone(storage),
                 start,
             );
+            schedule_endless_refill(playback.clone(), Arc::clone(catalog));
             (event, false)
         }
         ClientCommand::QueueTrack(track) => {
@@ -395,13 +416,20 @@ async fn apply_command(
                 .as_ref()
                 .is_some_and(|current| current.id == track.id);
             if !is_current
+                && snapshot.playback.queue.len() < MAX_VISIBLE_QUEUE
                 && !snapshot
                     .playback
                     .queue
                     .iter()
                     .any(|queued| queued.id == track.id)
             {
-                snapshot.playback.queue.push(track);
+                let reserved = playback
+                    .endless_queue
+                    .lock()
+                    .is_ok_and(|mut endless| endless.reserve(&track.id));
+                if reserved {
+                    snapshot.playback.queue.push(track);
+                }
             }
             (snapshot_event(snapshot.clone()), false)
         }
@@ -528,8 +556,10 @@ async fn apply_command(
         }
         ClientCommand::NextTrack => {
             let mut snapshot = state.lock().await;
+            top_up_endless_queue(playback, &mut snapshot);
             remember_current(&mut snapshot);
             refill_repeat_queue(&mut snapshot);
+            cap_and_top_up_queue(playback, &mut snapshot);
             let Some(track) = take_queue_track(&mut snapshot, 0) else {
                 invalidate_playback(&mut snapshot, playback_generation);
                 drop(snapshot);
@@ -548,6 +578,7 @@ async fn apply_command(
                 snapshot.playback.error = None;
                 return (snapshot_event(snapshot.clone()), false);
             };
+            top_up_endless_queue(playback, &mut snapshot);
             let request_id = prepare_track(&mut snapshot, playback_generation, &track);
             let event = snapshot_event(snapshot.clone());
             drop(snapshot);
@@ -560,6 +591,7 @@ async fn apply_command(
                 Arc::clone(storage),
                 PlaybackStart::Crossfade(Duration::from_millis(500)),
             );
+            schedule_endless_refill(playback.clone(), Arc::clone(catalog));
             (event, false)
         }
         ClientCommand::PreviousTrack => {
@@ -575,6 +607,7 @@ async fn apply_command(
             if let Some(current) = snapshot.playback.current.take() {
                 snapshot.playback.queue.insert(0, current);
             }
+            cap_and_top_up_queue(playback, &mut snapshot);
             let request_id = prepare_track(&mut snapshot, playback_generation, &track);
             let event = snapshot_event(snapshot.clone());
             drop(snapshot);
@@ -638,6 +671,7 @@ async fn apply_command(
             let Some(track) = take_queue_track(&mut snapshot, index) else {
                 return (snapshot_event(snapshot.clone()), false);
             };
+            top_up_endless_queue(playback, &mut snapshot);
             remember_current(&mut snapshot);
             let request_id = prepare_track(&mut snapshot, playback_generation, &track);
             let event = snapshot_event(snapshot.clone());
@@ -651,16 +685,22 @@ async fn apply_command(
                 Arc::clone(storage),
                 PlaybackStart::Crossfade(Duration::from_millis(500)),
             );
+            schedule_endless_refill(playback.clone(), Arc::clone(catalog));
             (event, false)
         }
         ClientCommand::RemoveQueueIndex(index) => {
             let mut snapshot = state.lock().await;
             let _ = take_queue_track(&mut snapshot, index);
+            top_up_endless_queue(playback, &mut snapshot);
+            schedule_endless_refill(playback.clone(), Arc::clone(catalog));
             (snapshot_event(snapshot.clone()), false)
         }
         ClientCommand::ClearQueue => {
             let mut snapshot = state.lock().await;
             snapshot.playback.queue.clear();
+            if let Ok(mut endless) = playback.endless_queue.lock() {
+                endless.stop();
+            }
             (snapshot_event(snapshot.clone()), false)
         }
         ClientCommand::SeekRelative(offset_ms) => {
@@ -757,6 +797,86 @@ fn remember_current(snapshot: &mut AppSnapshot) {
 
 fn take_queue_track(snapshot: &mut AppSnapshot, index: usize) -> Option<Track> {
     (index < snapshot.playback.queue.len()).then(|| snapshot.playback.queue.remove(index))
+}
+
+fn start_endless_queue(
+    playback: &PlaybackCoordinator,
+    snapshot: &mut AppSnapshot,
+    seed: &Track,
+    candidates: Vec<Track>,
+) {
+    let mut seen = HashSet::from([seed.id.clone()]);
+    let candidates = candidates
+        .into_iter()
+        .filter(|track| seen.insert(track.id.clone()))
+        .collect::<Vec<_>>();
+    snapshot.playback.queue = candidates.iter().take(MAX_VISIBLE_QUEUE).cloned().collect();
+    if let Ok(mut endless) = playback.endless_queue.lock() {
+        endless.start(
+            seed,
+            &snapshot.playback.queue,
+            candidates.into_iter().skip(MAX_VISIBLE_QUEUE),
+        );
+    }
+}
+
+fn top_up_endless_queue(playback: &PlaybackCoordinator, snapshot: &mut AppSnapshot) {
+    if let Ok(mut endless) = playback.endless_queue.lock() {
+        endless.top_up(&mut snapshot.playback.queue);
+    }
+}
+
+fn cap_and_top_up_queue(playback: &PlaybackCoordinator, snapshot: &mut AppSnapshot) {
+    if let Ok(mut endless) = playback.endless_queue.lock() {
+        endless.stash_overflow(&mut snapshot.playback.queue);
+        endless.top_up(&mut snapshot.playback.queue);
+    } else {
+        snapshot.playback.queue.truncate(MAX_VISIBLE_QUEUE);
+    }
+}
+
+fn schedule_endless_refill(playback: PlaybackCoordinator, catalog: Arc<dyn MusicCatalog>) {
+    tokio::spawn(async move {
+        loop {
+            let visible_count = playback.state.lock().await.playback.queue.len();
+            let (request, retry_delay) = playback
+                .endless_queue
+                .lock()
+                .map(|mut endless| {
+                    let request = endless.request(visible_count);
+                    let retry_delay = endless.retry_delay(visible_count);
+                    (request, retry_delay)
+                })
+                .unwrap_or((None, None));
+            let Some((generation, request)) = request else {
+                if let Some(delay) = retry_delay {
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return;
+            };
+
+            match catalog.radio_tracks(request).await {
+                Ok(page) => {
+                    let accepted = playback
+                        .endless_queue
+                        .lock()
+                        .is_ok_and(|mut endless| endless.accept(generation, page));
+                    if !accepted {
+                        return;
+                    }
+
+                    let mut snapshot = playback.state.lock().await;
+                    top_up_endless_queue(&playback, &mut snapshot);
+                }
+                Err(_) => {
+                    if let Ok(mut endless) = playback.endless_queue.lock() {
+                        endless.reject(generation);
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn refill_repeat_queue(snapshot: &mut AppSnapshot) {
@@ -1039,6 +1159,7 @@ async fn refresh_playback_telemetry(
         snapshot.playback.spectrum = telemetry.spectrum;
         snapshot.playback.underrun_count = telemetry.underrun_count;
         if snapshot.playback.status == PlaybackStatus::Playing {
+            top_up_endless_queue(playback, &mut snapshot);
             let crossfade = Duration::from_secs(u64::from(snapshot.settings.crossfade_seconds));
             let lead_ms =
                 u64::try_from((crossfade + CROSSFADE_PREPARE_LEAD).as_millis()).unwrap_or(u64::MAX);
@@ -1054,6 +1175,7 @@ async fn refresh_playback_telemetry(
                 } else {
                     remember_current(&mut snapshot);
                     refill_repeat_queue(&mut snapshot);
+                    cap_and_top_up_queue(playback, &mut snapshot);
                     take_queue_track(&mut snapshot, 0)
                 };
                 let Some(track) = track else {
@@ -1061,6 +1183,7 @@ async fn refresh_playback_telemetry(
                     snapshot.playback.spectrum = [0; 24];
                     return;
                 };
+                top_up_endless_queue(playback, &mut snapshot);
                 let request_id = prepare_track(&mut snapshot, playback_generation, &track);
                 drop(snapshot);
                 spawn_playback(
@@ -1076,6 +1199,7 @@ async fn refresh_playback_telemetry(
                         PlaybackStart::Crossfade(crossfade)
                     },
                 );
+                schedule_endless_refill(playback.clone(), Arc::clone(catalog));
             }
         }
     }

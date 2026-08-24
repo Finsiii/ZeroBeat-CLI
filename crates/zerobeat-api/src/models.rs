@@ -41,6 +41,14 @@ pub(crate) struct SearchResponse {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct RadioResponse {
+    #[serde(default)]
+    pub items: Vec<SearchTrack>,
+    #[serde(default)]
+    pub continuation: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SearchTrack {
     pub video_id: String,
