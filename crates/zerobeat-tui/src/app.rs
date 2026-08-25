@@ -1,9 +1,36 @@
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use zerobeat_core::Route;
 use zerobeat_protocol::{
     AppSnapshot, ClientCommand, PlaybackSnapshot, PlaybackStatus, SPECTRUM_BAND_COUNT,
     SearchSnapshot, SearchStatus,
 };
+
+const TRANSPORT_COOLDOWN: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct TransportCooldown {
+    blocked_until: Option<Instant>,
+}
+
+impl TransportCooldown {
+    fn try_acquire(&mut self, now: Instant) -> bool {
+        if self.is_active_at(now) {
+            return false;
+        }
+        self.restart_at(now);
+        true
+    }
+
+    fn restart_at(&mut self, now: Instant) {
+        self.blocked_until = Some(now + TRANSPORT_COOLDOWN);
+    }
+
+    fn is_active_at(&self, now: Instant) -> bool {
+        self.blocked_until.is_some_and(|until| now < until)
+    }
+}
 
 #[derive(Default)]
 pub struct App {
@@ -19,6 +46,7 @@ pub struct App {
     spectrum_smoothed: [u8; SPECTRUM_BAND_COUNT],
     spectrum_initialized: bool,
     spectrum_track_id: Option<String>,
+    transport_cooldown: TransportCooldown,
 }
 
 impl App {
@@ -123,6 +151,14 @@ impl App {
         self.should_quit
     }
 
+    pub fn transport_cooling_down(&self) -> bool {
+        self.transport_cooldown.is_active_at(Instant::now())
+    }
+
+    pub fn extend_transport_cooldown(&mut self) {
+        self.transport_cooldown.restart_at(Instant::now());
+    }
+
     pub fn open(&mut self, route: Route) {
         self.search_focused = false;
         self.queue_focused = false;
@@ -131,6 +167,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, event: KeyEvent) -> Option<ClientCommand> {
+        self.handle_key_at(event, Instant::now())
+    }
+
+    fn handle_key_at(&mut self, event: KeyEvent, now: Instant) -> Option<ClientCommand> {
         if self.search_focused {
             return self.handle_search_key(event.code);
         }
@@ -190,8 +230,8 @@ impl App {
                 ))
             }
             KeyCode::Char(' ') => Some(ClientCommand::TogglePlayback),
-            KeyCode::Char('p') => Some(ClientCommand::PreviousTrack),
-            KeyCode::Char('n') => Some(ClientCommand::NextTrack),
+            KeyCode::Char('p') => self.transport_command(ClientCommand::PreviousTrack, now),
+            KeyCode::Char('n') => self.transport_command(ClientCommand::NextTrack, now),
             KeyCode::Char('s') => Some(ClientCommand::ToggleShuffle),
             KeyCode::Char('r') => Some(ClientCommand::CycleRepeat),
             KeyCode::Char('m') => Some(ClientCommand::ToggleMute),
@@ -225,6 +265,15 @@ impl App {
         &mut self,
         event: MouseEvent,
         hits: &crate::HitMap,
+    ) -> Option<ClientCommand> {
+        self.handle_mouse_at(event, hits, Instant::now())
+    }
+
+    fn handle_mouse_at(
+        &mut self,
+        event: MouseEvent,
+        hits: &crate::HitMap,
+        now: Instant,
     ) -> Option<ClientCommand> {
         if matches!(
             event.kind,
@@ -266,9 +315,11 @@ impl App {
                 Some(ClientCommand::SeekTo(position))
             }
             crate::MouseTarget::Shuffle => Some(ClientCommand::ToggleShuffle),
-            crate::MouseTarget::Previous => Some(ClientCommand::PreviousTrack),
+            crate::MouseTarget::Previous => {
+                self.transport_command(ClientCommand::PreviousTrack, now)
+            }
             crate::MouseTarget::PlayPause => Some(ClientCommand::TogglePlayback),
-            crate::MouseTarget::Next => Some(ClientCommand::NextTrack),
+            crate::MouseTarget::Next => self.transport_command(ClientCommand::NextTrack, now),
             crate::MouseTarget::Repeat => Some(ClientCommand::CycleRepeat),
             crate::MouseTarget::Like => self
                 .playback()
@@ -300,6 +351,10 @@ impl App {
             Route::Settings => None,
         };
         selected.or_else(|| self.playback().current.clone())
+    }
+
+    fn transport_command(&mut self, command: ClientCommand, now: Instant) -> Option<ClientCommand> {
+        self.transport_cooldown.try_acquire(now).then_some(command)
     }
 
     fn track_at(&self, index: usize) -> Option<zerobeat_core::Track> {
@@ -477,5 +532,46 @@ fn smooth_band(current: u8, target: u8) -> u8 {
     } else {
         let delta = u16::from(current - target);
         current.saturating_sub(delta.div_ceil(5) as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+
+    #[test]
+    fn transport_cooldown_reopens_at_exactly_two_seconds() {
+        let start = Instant::now();
+        let mut app = App::default();
+
+        assert_eq!(
+            app.handle_key_at(key('n'), start),
+            Some(ClientCommand::NextTrack)
+        );
+        assert_eq!(
+            app.handle_key_at(key('p'), start + Duration::from_millis(1_999)),
+            None
+        );
+        assert_eq!(
+            app.handle_key_at(key('p'), start + Duration::from_secs(2)),
+            Some(ClientCommand::PreviousTrack)
+        );
+    }
+
+    #[test]
+    fn completed_transport_restarts_the_full_cooldown() {
+        let start = Instant::now();
+        let mut cooldown = TransportCooldown::default();
+
+        assert!(cooldown.try_acquire(start));
+        cooldown.restart_at(start + Duration::from_millis(750));
+        assert!(cooldown.is_active_at(start + Duration::from_millis(2_749)));
+        assert!(!cooldown.is_active_at(start + Duration::from_millis(2_750)));
+    }
+
+    fn key(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
     }
 }

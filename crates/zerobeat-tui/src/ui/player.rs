@@ -164,16 +164,19 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
         format!("Vol {}%", app.playback().volume_percent)
     };
     let wide = area.width >= 112;
+    let transport_disabled = app.transport_cooling_down();
     let controls = [
         (
             MouseTarget::Shuffle,
             if wide { "(s) Shuffle" } else { "(s)" }.to_owned(),
             app.playback().shuffle,
+            false,
         ),
         (
             MouseTarget::Previous,
             if wide { "(p) Prev" } else { "(p)" }.to_owned(),
             false,
+            transport_disabled,
         ),
         (
             MouseTarget::PlayPause,
@@ -188,11 +191,13 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
             }
             .to_owned(),
             true,
+            false,
         ),
         (
             MouseTarget::Next,
             if wide { "(n) Next" } else { "(n)" }.to_owned(),
             false,
+            transport_disabled,
         ),
         (
             MouseTarget::Repeat,
@@ -202,6 +207,7 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
                 "(r)".to_owned()
             },
             app.playback().repeat_mode != RepeatMode::Off,
+            false,
         ),
         (
             MouseTarget::Like,
@@ -212,16 +218,19 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
             }
             .to_owned(),
             liked,
+            false,
         ),
         (
             MouseTarget::Lyrics,
             if wide { "(y) Lyrics" } else { "(y)" }.to_owned(),
             app.lyrics().visible,
+            false,
         ),
         (
             MouseTarget::Queue,
             if wide { "(u) Queue" } else { "(u)" }.to_owned(),
             app.queue_focused(),
+            false,
         ),
         (
             MouseTarget::Mute,
@@ -233,21 +242,24 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) 
                 format!("(m){}", app.playback().volume_percent)
             },
             app.playback().muted,
+            false,
         ),
     ];
     let gap = if wide { 2_u16 } else { 1_u16 };
-    let content_width = controls.iter().fold(0_u16, |width, (_, label, _)| {
+    let content_width = controls.iter().fold(0_u16, |width, (_, label, _, _)| {
         width.saturating_add(label.chars().count() as u16)
     });
     let total_width = content_width.saturating_add(gap * (controls.len() as u16 - 1));
     let mut x = area
         .x
         .saturating_add(area.width.saturating_sub(total_width) / 2);
-    for (index, (target, label, active)) in controls.iter().enumerate() {
+    for (index, (target, label, active, disabled)) in controls.iter().enumerate() {
         let width = label.chars().count() as u16;
         let region = Rect::new(x, area.y, width, 1);
         frame.render_widget(
-            Paragraph::new(label.as_str()).style(Style::default().fg(if *active {
+            Paragraph::new(label.as_str()).style(Style::default().fg(if *disabled {
+                theme::BORDER
+            } else if *active {
                 theme::ACCENT
             } else {
                 theme::TEXT_MUTED

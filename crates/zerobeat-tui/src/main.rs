@@ -34,8 +34,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         };
         if let Some(command) = command {
+            let transport_command = matches!(
+                command,
+                ClientCommand::PreviousTrack | ClientCommand::NextTrack
+            );
             let snapshot = client.execute(command).await?;
             app.replace_snapshot(snapshot);
+            if transport_command {
+                app.extend_transport_cooldown();
+            }
         }
     }
 

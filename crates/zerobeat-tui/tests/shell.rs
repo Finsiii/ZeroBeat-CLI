@@ -504,6 +504,38 @@ fn transport_shortcuts_cover_shuffle_repeat_previous_mute_and_queue_cleanup() {
 }
 
 #[test]
+fn previous_and_next_share_a_two_second_spam_guard() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000));
+    let mut app = App::new(snapshot);
+    let (_, hits) = render_screen_with_hits(140, 38, &app);
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('n'))),
+        Some(ClientCommand::NextTrack)
+    );
+    let previous = hits.region(MouseTarget::Previous).unwrap();
+    assert_eq!(app.handle_mouse(click(previous.x, previous.y), &hits), None);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char(' '))),
+        Some(ClientCommand::TogglePlayback)
+    );
+}
+
+#[test]
+fn previous_and_next_share_a_cooldown() {
+    let mut app = App::default();
+
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('p'))),
+        Some(ClientCommand::PreviousTrack)
+    );
+    assert_eq!(app.handle_key(key(KeyCode::Char('n'))), None);
+    assert_eq!(app.handle_key(key(KeyCode::Char('p'))), None);
+}
+
+#[test]
 fn mouse_targets_navigate_seek_play_and_control_transport() {
     let mut snapshot = AppSnapshot::default();
     snapshot.playback.status = PlaybackStatus::Playing;
