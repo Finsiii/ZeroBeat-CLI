@@ -19,14 +19,14 @@ usage() {
 Usage: scripts/benchmark.sh [options]
 
 Read-only benchmark for one already-running ZeroBeat TUI and its daemon. By
-default it selects one owned zerobeat and one owned zerobeatd; with stale
+default it selects one owned zerobeat-cli and one owned zerobeatd; with stale
 daemons, the selected daemon must be the TUI child. Use --pid exactly twice
 to select one explicit PID for each role.
 
 Options:
   --duration SECONDS  Measurement duration (default: 30, maximum: 86400)
   --interval SECONDS  Sampling interval (default: 1, maximum: 3600)
-  --pid PID           Explicit PID; provide exactly one zerobeat and one zerobeatd
+  --pid PID           Explicit PID; provide exactly one zerobeat-cli and one zerobeatd
   -h, --help          Show this help
 
 The benchmark reads process metrics from /proc and host metadata only. It does
@@ -113,7 +113,7 @@ process_comm() {
     [ -r "/proc/$pid/comm" ] || return 1
     comm=$(<"/proc/$pid/comm") || return 1
     case "$comm" in
-        zerobeat|zerobeatd) printf '%s' "$comm" ;;
+        zerobeat-cli|zerobeatd) printf '%s' "$comm" ;;
         *) return 1 ;;
     esac
 }
@@ -142,7 +142,7 @@ validate_process() {
     local comm
 
     comm=$(process_comm "$pid") ||
-        die_runtime "PID $pid disappeared or comm is not exactly zerobeat/zerobeatd"
+        die_runtime "PID $pid disappeared or comm is not exactly zerobeat-cli/zerobeatd"
     process_is_owned "$pid" ||
         die_runtime "PID $pid is not owned by the current UID ($current_uid)"
     printf '%s\t%s' "$pid" "$comm"
@@ -165,7 +165,7 @@ declare -a pids=()
 declare -a names=()
 if (( ${#requested_pids[@]} > 0 )); then
     (( ${#requested_pids[@]} == 2 )) ||
-        die_usage 'explicit --pid mode requires exactly two PIDs: one zerobeat and one zerobeatd'
+        die_usage 'explicit --pid mode requires exactly two PIDs: one zerobeat-cli and one zerobeatd'
     declare -A seen_pids=()
     for pid in "${requested_pids[@]}"; do
         [ -z "${seen_pids[$pid]+x}" ] || die_usage "PID $pid was provided more than once"
@@ -175,16 +175,16 @@ if (( ${#requested_pids[@]} > 0 )); then
         pids+=("$validated_pid")
         names+=("$validated_name")
     done
-    zerobeat_count=0
+    zerobeat_cli_count=0
     zerobeatd_count=0
     for name in "${names[@]}"; do
         case "$name" in
-            zerobeat) zerobeat_count=$((zerobeat_count + 1)) ;;
+            zerobeat-cli) zerobeat_cli_count=$((zerobeat_cli_count + 1)) ;;
             zerobeatd) zerobeatd_count=$((zerobeatd_count + 1)) ;;
         esac
     done
-    (( zerobeat_count == 1 && zerobeatd_count == 1 )) ||
-        die_usage 'explicit --pid mode requires exactly one zerobeat and one zerobeatd PID'
+    (( zerobeat_cli_count == 1 && zerobeatd_count == 1 )) ||
+        die_usage 'explicit --pid mode requires exactly one zerobeat-cli and one zerobeatd PID'
 else
     mapfile -t discovered < <(discover_processes | sort -n -k1,1)
     declare -a tui_candidates=()
@@ -194,7 +194,7 @@ else
         [ -n "$process_info" ] || continue
         IFS=$'\t' read -r discovered_pid discovered_name discovered_parent <<< "$process_info"
         case "$discovered_name" in
-            zerobeat) tui_candidates+=("$discovered_pid") ;;
+            zerobeat-cli) tui_candidates+=("$discovered_pid") ;;
             zerobeatd)
                 daemon_candidates+=("$discovered_pid")
                 daemon_parents+=("$discovered_parent")
@@ -202,7 +202,7 @@ else
         esac
     done
     if (( ${#tui_candidates[@]} != 1 )); then
-        die_runtime "expected exactly one owned zerobeat TUI, found ${#tui_candidates[@]}; pass --pid TUI_PID --pid DAEMON_PID"
+        die_runtime "expected exactly one owned zerobeat-cli TUI, found ${#tui_candidates[@]}; pass --pid TUI_PID --pid DAEMON_PID"
     fi
     (( ${#daemon_candidates[@]} > 0 )) ||
         die_runtime "no owned zerobeatd daemon found; pass --pid TUI_PID --pid DAEMON_PID"
@@ -214,13 +214,13 @@ else
         fi
     done
     (( ${#child_daemons[@]} == 1 )) ||
-        die_runtime "found ${#daemon_candidates[@]} owned zerobeatd processes but could not identify exactly one child of TUI PID $tui_pid; pass --pid TUI_PID --pid DAEMON_PID"
+        die_runtime "found ${#daemon_candidates[@]} owned zerobeatd processes but could not identify exactly one child of zerobeat-cli TUI PID $tui_pid; pass --pid TUI_PID --pid DAEMON_PID"
     daemon_pid=${child_daemons[0]}
     pids=("$tui_pid" "$daemon_pid")
-    names=(zerobeat zerobeatd)
+    names=(zerobeat-cli zerobeatd)
 fi
 
-(( ${#pids[@]} == 2 )) || die_runtime 'benchmark requires exactly one zerobeat TUI and one zerobeatd daemon'
+(( ${#pids[@]} == 2 )) || die_runtime 'benchmark requires exactly one zerobeat-cli TUI and one zerobeatd daemon'
 
 read_process_stat() {
     local pid=$1

@@ -28,8 +28,8 @@ uses sudo and never removes user data.
 
 Examples:
   ./install.sh
-  VERSION=v0.1.0 ./install.sh
-  PREFIX=/usr/local VERSION=v0.1.0 ./install.sh
+  VERSION=v0.1.2 ./install.sh
+  PREFIX=/usr/local VERSION=v0.1.2 ./install.sh
   ./install.sh --uninstall
 EOF
 }
@@ -102,7 +102,7 @@ recheck_paths() {
     reject_symlink "$SHARE_DIR"
     reject_symlink "$MANIFEST_DIR"
     reject_symlink "$MANIFEST"
-    reject_symlink "$BINDIR/zerobeat"
+    reject_symlink "$BINDIR/zerobeat-cli"
     reject_symlink "$BINDIR/zerobeatd"
 }
 
@@ -124,25 +124,25 @@ read_manifest() {
     [ -f "$MANIFEST" ] || return 1
     reject_symlink "$MANIFEST"
     ensure_owned "$MANIFEST" || return 1
-    MANIFEST_ZEROBEAT=$(awk '$1 == "zerobeat" && NF == 2 { print $2 }' "$MANIFEST")
+    MANIFEST_ZEROBEAT=$(awk '$1 == "zerobeat-cli" && NF == 2 { print $2 }' "$MANIFEST")
     MANIFEST_DAEMON=$(awk '$1 == "zerobeatd" && NF == 2 { print $2 }' "$MANIFEST")
     valid_digest "$MANIFEST_ZEROBEAT" || return 1
     valid_digest "$MANIFEST_DAEMON" || return 1
-    [ "$(awk 'NF != 2 || ($1 != "zerobeat" && $1 != "zerobeatd") { bad=1 } END { print bad + 0 }' "$MANIFEST")" -eq 0 ] ||
+    [ "$(awk 'NF != 2 || ($1 != "zerobeat-cli" && $1 != "zerobeatd") { bad=1 } END { print bad + 0 }' "$MANIFEST")" -eq 0 ] ||
         return 1
-    [ "$(grep -c -E '^zerobeat ' "$MANIFEST")" -eq 1 ] || return 1
+    [ "$(grep -c -E '^zerobeat-cli ' "$MANIFEST")" -eq 1 ] || return 1
     [ "$(grep -c -E '^zerobeatd ' "$MANIFEST")" -eq 1 ] || return 1
 }
 
 verify_installed_pair() {
     read_manifest || return 1
-    for binary in zerobeat zerobeatd; do
+    for binary in zerobeat-cli zerobeatd; do
         path="$BINDIR/$binary"
         [ -f "$path" ] || return 1
         reject_symlink "$path"
         ensure_owned "$path" || return 1
     done
-    [ "$(sha256sum "$BINDIR/zerobeat" | awk '{print $1}')" = "$MANIFEST_ZEROBEAT" ] || return 1
+    [ "$(sha256sum "$BINDIR/zerobeat-cli" | awk '{print $1}')" = "$MANIFEST_ZEROBEAT" ] || return 1
     [ "$(sha256sum "$BINDIR/zerobeatd" | awk '{print $1}')" = "$MANIFEST_DAEMON" ] || return 1
 }
 
@@ -195,7 +195,7 @@ if [ "$ACTION" = uninstall ]; then
     verify_installed_pair || die 'installed files are modified, unowned, or do not match the installer manifest'
     recheck_paths
     verify_installed_pair || die 'installed files changed during uninstall preflight; refusing removal'
-    rm -f "$BINDIR/zerobeat" "$BINDIR/zerobeatd" "$MANIFEST"
+    rm -f "$BINDIR/zerobeat-cli" "$BINDIR/zerobeatd" "$MANIFEST"
     printf 'Removed ZeroBeat executables and installer manifest; user data was preserved.\n'
     exit 0
 fi
@@ -211,7 +211,7 @@ command -v cp >/dev/null 2>&1 || die 'cp is required'
 if [ -e "$MANIFEST" ]; then
     verify_installed_pair || die 'existing installation is modified, unowned, or has an invalid installer manifest'
 else
-    if [ -e "$BINDIR/zerobeat" ] || [ -e "$BINDIR/zerobeatd" ]; then
+    if [ -e "$BINDIR/zerobeat-cli" ] || [ -e "$BINDIR/zerobeatd" ]; then
         die 'existing destination binary has no valid installer manifest; refusing overwrite'
     fi
 fi
@@ -223,7 +223,7 @@ case "$VERSION" in
     v[0-9]*)
         BASE_URL=${ZEROBEAT_RELEASE_BASE_URL:-"https://github.com/$REPOSITORY/releases/download/$VERSION"}
         ;;
-    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.0)' ;;
+    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.2)' ;;
 esac
 
 case "$BASE_URL" in
@@ -239,7 +239,7 @@ esac
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/zerobeat-install.XXXXXX")
 STAGE_DIR=''
 BACKUP_DIR=''
-NEW_ONE="$BINDIR/.zerobeat.new.$$"
+NEW_ONE="$BINDIR/.zerobeat-cli.new.$$"
 NEW_DAEMON="$BINDIR/.zerobeatd.new.$$"
 NEW_MANIFEST="$MANIFEST_DIR/.install-manifest.new.$$"
 HAD_ONE=0
@@ -262,9 +262,9 @@ rollback() {
     if [ "$TRANSACTION_ACTIVE" -eq 1 ]; then
         rm -f "$NEW_ONE" "$NEW_DAEMON" "$NEW_MANIFEST" || rollback_failed=1
         if [ "$HAD_ONE" -eq 1 ]; then
-            cp -p "$BACKUP_DIR/zerobeat" "$BINDIR/zerobeat" || rollback_failed=1
+            cp -p "$BACKUP_DIR/zerobeat-cli" "$BINDIR/zerobeat-cli" || rollback_failed=1
         else
-            rm -f "$BINDIR/zerobeat" || rollback_failed=1
+            rm -f "$BINDIR/zerobeat-cli" || rollback_failed=1
         fi
         if [ "$HAD_DAEMON" -eq 1 ]; then
             cp -p "$BACKUP_DIR/zerobeatd" "$BINDIR/zerobeatd" || rollback_failed=1
@@ -344,20 +344,20 @@ ACTUAL=$(sha256sum "$ARCHIVE_PATH" | awk '{print $1}')
 
 MANIFEST_LIST="$TMP_DIR/archive-manifest"
 tar -tzf "$ARCHIVE_PATH" > "$MANIFEST_LIST" || die 'archive is not a readable gzip tar archive'
-for entry in zerobeat zerobeatd README.md LICENSE; do
+for entry in zerobeat-cli zerobeatd README.md LICENSE; do
     grep -F -x "$entry" "$MANIFEST_LIST" >/dev/null 2>&1 ||
         die "archive is missing $entry"
 done
 while IFS= read -r entry; do
     case "$entry" in
-        zerobeat|zerobeatd|README.md|LICENSE) ;;
+        zerobeat-cli|zerobeatd|README.md|LICENSE) ;;
         *) die "archive contains unexpected path: $entry" ;;
     esac
 done < "$MANIFEST_LIST"
 
 STAGE_DIR=$(mktemp -d "$TMP_DIR/stage.XXXXXX")
 tar -xzf "$ARCHIVE_PATH" -C "$STAGE_DIR" --no-same-owner --no-same-permissions
-for binary in zerobeat zerobeatd; do
+for binary in zerobeat-cli zerobeatd; do
     path="$STAGE_DIR/$binary"
     [ -f "$path" ] || die "$binary is not a regular file"
     [ ! -L "$path" ] || die "$binary is a symlink"
@@ -372,8 +372,8 @@ recheck_paths
 mkdir -p "$BINDIR" "$MANIFEST_DIR"
 recheck_paths
 BACKUP_DIR=$(mktemp -d "$TMP_DIR/backup.XXXXXX")
-if [ -e "$BINDIR/zerobeat" ]; then
-    cp -p "$BINDIR/zerobeat" "$BACKUP_DIR/zerobeat"
+if [ -e "$BINDIR/zerobeat-cli" ]; then
+    cp -p "$BINDIR/zerobeat-cli" "$BACKUP_DIR/zerobeat-cli"
     HAD_ONE=1
 fi
 if [ -e "$BINDIR/zerobeatd" ]; then
@@ -387,14 +387,14 @@ fi
 TRANSACTION_ACTIVE=1
 
 recheck_paths
-install -m 755 "$STAGE_DIR/zerobeat" "$NEW_ONE"
+install -m 755 "$STAGE_DIR/zerobeat-cli" "$NEW_ONE"
 install -m 755 "$STAGE_DIR/zerobeatd" "$NEW_DAEMON"
-ONE_HASH=$(sha256sum "$STAGE_DIR/zerobeat" | awk '{print $1}')
+ONE_HASH=$(sha256sum "$STAGE_DIR/zerobeat-cli" | awk '{print $1}')
 DAEMON_HASH=$(sha256sum "$STAGE_DIR/zerobeatd" | awk '{print $1}')
-printf 'zerobeat %s\nzerobeatd %s\n' "$ONE_HASH" "$DAEMON_HASH" > "$NEW_MANIFEST"
+printf 'zerobeat-cli %s\nzerobeatd %s\n' "$ONE_HASH" "$DAEMON_HASH" > "$NEW_MANIFEST"
 chmod 644 "$NEW_MANIFEST"
 recheck_paths
-mv -f "$NEW_ONE" "$BINDIR/zerobeat"
+mv -f "$NEW_ONE" "$BINDIR/zerobeat-cli"
 mv -f "$NEW_DAEMON" "$BINDIR/zerobeatd"
 mv -f "$NEW_MANIFEST" "$MANIFEST"
 TRANSACTION_ACTIVE=0
@@ -406,4 +406,4 @@ case ":${PATH:-}:" in
     *":$BINDIR:"*) ;;
     *) printf 'Add this directory to PATH: export PATH="%s:%s"\n' "$BINDIR" "\$PATH" ;;
 esac
-printf 'Run: zerobeat\n'
+printf 'Run: zerobeat-cli\n'

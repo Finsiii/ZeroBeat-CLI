@@ -48,7 +48,7 @@ Add the default bin directory to the current shell and start the player:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
-zerobeat
+zerobeat-cli
 ```
 
 The TUI starts `zerobeatd` automatically for the current user. For a specific
@@ -74,7 +74,7 @@ Download the archive and checksum for a release, then verify before
 extracting:
 
 ```bash
-version=v0.1.1
+version=v0.1.2
 base="https://github.com/Finsiii/ZeroBeat-CLI/releases/download/$version"
 mkdir -p "$HOME/tmp/zerobeat-$version"
 cd "$HOME/tmp/zerobeat-$version"
@@ -92,10 +92,10 @@ gh attestation verify zerobeat-linux-x86_64.tar.gz \
 
 ```bash
 tar -xzf zerobeat-linux-x86_64.tar.gz
-install -Dm755 zerobeat "$HOME/.local/bin/zerobeat"
+install -Dm755 zerobeat-cli "$HOME/.local/bin/zerobeat-cli"
 install -Dm755 zerobeatd "$HOME/.local/bin/zerobeatd"
 export PATH="$HOME/.local/bin:$PATH"
-zerobeat
+zerobeat-cli
 ```
 
 ## Build from source
@@ -129,10 +129,10 @@ rustup toolchain install 1.96.0 --profile minimal
 rustup component add --toolchain 1.96.0 rustfmt clippy
 rustup default 1.96.0
 cargo build --workspace --release --locked
-install -Dm755 target/release/zerobeat "$HOME/.local/bin/zerobeat"
+install -Dm755 target/release/zerobeat-cli "$HOME/.local/bin/zerobeat-cli"
 install -Dm755 target/release/zerobeatd "$HOME/.local/bin/zerobeatd"
 export PATH="$HOME/.local/bin:$PATH"
-zerobeat
+zerobeat-cli
 ```
 
 ## Controls
@@ -172,10 +172,10 @@ README. The installer verifies checksums, restricts the archive contents,
 validates both ELF dependencies, rejects unsafe symlink paths, and records an
 ownership-checked manifest.
 
-- `zerobeat: command not found`: run `export PATH="$HOME/.local/bin:$PATH"`
+- `zerobeat-cli: command not found`: run `export PATH="$HOME/.local/bin:$PATH"`
   or invoke the absolute path under your chosen prefix.
 - Native library errors: install the dependencies above, then run `ldd
-  target/release/zerobeat` and `ldd target/release/zerobeatd`; neither should
+  target/release/zerobeat-cli` and `ldd target/release/zerobeatd`; neither should
   report `not found`.
 - No audio: check that an ALSA, PulseAudio, or PipeWire session is available
   for the current user and that output is not muted.
@@ -187,7 +187,7 @@ ownership-checked manifest.
 
 `scripts/benchmark.sh` is read-only. It measures already-running processes via
 `/proc`, never launches or signals them, and never changes playback or state.
-By default it selects exactly one owned `zerobeat` TUI and one owned
+By default it selects exactly one owned `zerobeat-cli` TUI and one owned
 `zerobeatd`. If multiple daemons exist, it selects only the daemon whose
 parent is that TUI; ambiguous or missing pairs fail with an explicit-PID
 instruction. Use exactly two `--pid PID` options to select one process of
@@ -216,7 +216,7 @@ scripts/benchmark.sh --duration 60 --interval 1 \
   --pid "$daemon_pid"
 ```
 
-Replace the placeholders with the owned `zerobeat` and `zerobeatd` PIDs.
+Replace the placeholders with the owned `zerobeat-cli` and `zerobeatd` PIDs.
 
 The report includes distro, kernel, CPU, PIDs, samples, combined mean/peak
 RSS, overall mean CPU, and peak interval CPU. CPU uses `100% = one core`.

@@ -53,6 +53,6 @@ jobs:
 
       - name: Check native shared-library resolution
         run: |
-          missing="$(ldd target/release/zerobeat | grep 'not found' || true)"
+          missing="$(ldd target/release/zerobeat-cli | grep 'not found' || true)"
           missing="$missing$(ldd target/release/zerobeatd | grep 'not found' || true)"
           test -z "$missing"

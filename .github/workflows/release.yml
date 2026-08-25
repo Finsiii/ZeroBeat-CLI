@@ -59,7 +59,7 @@ jobs:
 
       - name: Check native shared-library resolution
         run: |
-          missing="$(ldd target/release/zerobeat | grep 'not found' || true)"
+          missing="$(ldd target/release/zerobeat-cli | grep 'not found' || true)"
           missing="$missing$(ldd target/release/zerobeatd | grep 'not found' || true)"
           test -z "$missing"
 
@@ -69,12 +69,12 @@ jobs:
           set -eu
           rm -rf dist
           mkdir -p dist/stage
-          install -m 755 target/release/zerobeat dist/stage/zerobeat
+          install -m 755 target/release/zerobeat-cli dist/stage/zerobeat-cli
           install -m 755 target/release/zerobeatd dist/stage/zerobeatd
           install -m 644 README.md dist/stage/README.md
           install -m 644 LICENSE dist/stage/LICENSE
           tar -C dist/stage -czf dist/zerobeat-linux-x86_64.tar.gz \
-            zerobeat zerobeatd README.md LICENSE
+            zerobeat-cli zerobeatd README.md LICENSE
           (cd dist && sha256sum zerobeat-linux-x86_64.tar.gz) \
             > dist/zerobeat-linux-x86_64.tar.gz.sha256
           echo "archive=dist/zerobeat-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
