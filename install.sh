@@ -28,8 +28,8 @@ uses sudo and never removes user data.
 
 Examples:
   ./install.sh
-  VERSION=v0.1.2 ./install.sh
-  PREFIX=/usr/local VERSION=v0.1.2 ./install.sh
+  VERSION=v0.1.3 ./install.sh
+  PREFIX=/usr/local VERSION=v0.1.3 ./install.sh
   ./install.sh --uninstall
 EOF
 }
@@ -223,7 +223,7 @@ case "$VERSION" in
     v[0-9]*)
         BASE_URL=${ZEROBEAT_RELEASE_BASE_URL:-"https://github.com/$REPOSITORY/releases/download/$VERSION"}
         ;;
-    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.2)' ;;
+    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.3)' ;;
 esac
 
 case "$BASE_URL" in
@@ -234,6 +234,32 @@ case "$BASE_URL" in
         CURL_SECURITY_ARGS=''
         ;;
     *) die 'release base must use https://' ;;
+esac
+
+read_os_release_value() {
+    key=$1
+    [ -r /etc/os-release ] || return 1
+    value=$(sed -n "s/^${key}=//p" /etc/os-release | sed -n '1p')
+    value=${value#\"}
+    value=${value%\"}
+    [ -n "$value" ] || return 1
+    printf '%s' "$value"
+}
+
+DISTRO_ID=$(read_os_release_value ID) || die 'could not identify Linux distribution from /etc/os-release'
+DISTRO_VERSION=$(read_os_release_value VERSION_ID || true)
+case "$DISTRO_ID" in
+    arch)
+        ARCHIVE_NAME=zerobeat-linux-arch-x86_64.tar.gz
+        ;;
+    ubuntu)
+        [ "$DISTRO_VERSION" = 24.04 ] ||
+            die "unsupported Ubuntu version: ${DISTRO_VERSION:-unknown}; prebuilt release requires Ubuntu 24.04"
+        ARCHIVE_NAME=zerobeat-linux-x86_64.tar.gz
+        ;;
+    *)
+        die "unsupported Linux distribution: $DISTRO_ID; prebuilt releases support Arch Linux and Ubuntu 24.04"
+        ;;
 esac
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/zerobeat-install.XXXXXX")
@@ -330,7 +356,6 @@ $needed
 EOF
 }
 
-ARCHIVE_NAME=zerobeat-linux-x86_64.tar.gz
 CHECKSUM_NAME="$ARCHIVE_NAME.sha256"
 ARCHIVE_PATH="$TMP_DIR/$ARCHIVE_NAME"
 CHECKSUM_PATH="$TMP_DIR/$CHECKSUM_NAME"

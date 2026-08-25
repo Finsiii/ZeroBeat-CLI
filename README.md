@@ -17,32 +17,45 @@ TUI, a small per-user daemon, native audio playback, and a local library.
 ZeroBeat Native DJ remains exclusive to the Android app. The Linux CLI uses
 the lightweight native playback and crossfade engine.
 
-The official prebuilt target is Ubuntu 24.04 Linux x86_64. Source builds are
-verified on Arch Linux x86_64. ARM, macOS, Windows, and other targets are not
-official release targets.
+The official prebuilt targets are Ubuntu 24.04 Linux x86_64 and Arch Linux
+x86_64. ARM, macOS, Windows, and other targets are not official release
+targets.
 
 ## Quick install
 
 The installer is user-scoped, verifies the release archive and SHA-256
-checksum, and never invokes `sudo`. Download it to a file, inspect it, and
-then run that file; do not pipe a network response into a shell:
+checksum, and never invokes `sudo`. Download it to a temporary file and run
+that file; do not pipe a network response into a shell. No optional pager is
+required:
 
 ```bash
+# Bash or Zsh
 installer=$(mktemp)
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/Finsiii/ZeroBeat-CLI/main/install.sh \
+  -o "$installer" &&
+  sh "$installer" &&
+  rm -f "$installer"
+```
+
+```fish
+# Fish
+set installer (mktemp)
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/Finsiii/ZeroBeat-CLI/main/install.sh \
   -o "$installer"
-less "$installer"
-sh "$installer"
-rm "$installer"
+and sh "$installer"
+and rm -f "$installer"
 ```
 
 The installer needs `curl`, `sha256sum`, `tar`, `mktemp`, `install`, and the
 standard POSIX tools. It also uses `readelf` from `binutils` and `ldconfig`
 from the system glibc package to validate the two ELF binaries. On a minimal
-system, install those packages before running it. The installer supports
-Linux x86_64 only and requires a writable absolute `PREFIX`; by default it
-uses `$HOME/.local`.
+system, install those packages before running it. On Ubuntu 24.04 it
+automatically selects the `zerobeat-linux-x86_64.tar.gz` artifact; on Arch
+Linux it selects `zerobeat-linux-arch-x86_64.tar.gz`. Other
+distro/version targets are rejected. The installer requires a writable
+absolute `PREFIX`; by default it uses `$HOME/.local`.
 
 Add the default bin directory to the current shell and start the player:
 
@@ -70,28 +83,33 @@ refuses to remove files that are missing, modified, unowned, or symlinks.
 
 ## Manual release installation
 
-Download the archive and checksum for a release, then verify before
-extracting:
+Download the platform-specific archive and checksum for v0.1.3, then verify
+before extracting. Choose exactly one archive name:
 
 ```bash
-version=v0.1.2
+version=v0.1.3
 base="https://github.com/Finsiii/ZeroBeat-CLI/releases/download/$version"
 mkdir -p "$HOME/tmp/zerobeat-$version"
 cd "$HOME/tmp/zerobeat-$version"
-curl --proto '=https' --tlsv1.2 -fLO "$base/zerobeat-linux-x86_64.tar.gz"
-curl --proto '=https' --tlsv1.2 -fLO "$base/zerobeat-linux-x86_64.tar.gz.sha256"
-sha256sum -c zerobeat-linux-x86_64.tar.gz.sha256
+# Ubuntu 24.04:
+archive=zerobeat-linux-x86_64.tar.gz
+# Arch Linux:
+# archive=zerobeat-linux-arch-x86_64.tar.gz
+checksum="$archive.sha256"
+curl --proto '=https' --tlsv1.2 -fLO "$base/$archive"
+curl --proto '=https' --tlsv1.2 -fLO "$base/$checksum"
+sha256sum -c "$checksum"
 ```
 
 Optionally verify GitHub's build provenance with GitHub CLI:
 
 ```bash
-gh attestation verify zerobeat-linux-x86_64.tar.gz \
+gh attestation verify "$archive" \
   --repo Finsiii/ZeroBeat-CLI
 ```
 
 ```bash
-tar -xzf zerobeat-linux-x86_64.tar.gz
+tar -xzf "$archive"
 install -Dm755 zerobeat-cli "$HOME/.local/bin/zerobeat-cli"
 install -Dm755 zerobeatd "$HOME/.local/bin/zerobeatd"
 export PATH="$HOME/.local/bin:$PATH"

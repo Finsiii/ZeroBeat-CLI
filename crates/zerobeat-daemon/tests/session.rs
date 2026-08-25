@@ -399,6 +399,15 @@ async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
         panic!("expected snapshot");
     };
     assert!(next.playback.history.is_empty());
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && snapshot
+                .playback
+                .current
+                .as_ref()
+                .is_some_and(|track| track.id == "video-456")
+    })
+    .await;
     let previous = exchange(&mut client, ClientCommand::PreviousTrack).await;
     let DaemonEvent::Snapshot(previous) = previous else {
         panic!("expected snapshot");
