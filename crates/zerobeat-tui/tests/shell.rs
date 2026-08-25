@@ -288,7 +288,7 @@ fn studio_deck_renders_real_spectrum_and_library_first_sidebar_without_capsules(
     ] {
         assert!(screen.contains(expected), "missing {expected:?}");
     }
-    assert!(screen.contains('█') || screen.contains('▆'));
+    assert!(screen.chars().any(is_braille_bar));
     assert!(!screen.contains("▁ ▁"));
     assert!(!screen.contains("ONLINE"));
     assert!(!screen.contains("[Online]"));
@@ -402,7 +402,7 @@ fn spectrum_deck_uses_multiple_visual_rows() {
     let screen = render_screen(140, 38, &App::new(snapshot));
     let visual_rows = screen
         .lines()
-        .filter(|line| line.contains('█') || line.contains('▇') || line.contains('▆'))
+        .filter(|line| line.chars().any(is_braille_bar))
         .count();
     assert!(
         visual_rows >= 3,
@@ -420,14 +420,14 @@ fn spectrum_visualizer_keeps_fixed_bar_slots() {
     let screen = render_screen(140, 38, &App::new(snapshot));
     let visual_rows = screen
         .lines()
-        .filter(|line| line.contains('█'))
+        .filter(|line| line.chars().any(is_braille_bar))
         .collect::<Vec<_>>();
     assert!(!visual_rows.is_empty(), "visualizer should render bars");
     assert!(visual_rows.iter().all(|line| {
         let columns = line
             .chars()
             .enumerate()
-            .filter(|(_, character)| *character == '█')
+            .filter(|(_, character)| is_braille_bar(*character))
             .map(|(column, _)| column)
             .collect::<Vec<_>>();
         columns.windows(2).all(|pair| pair[1] - pair[0] == 2)
@@ -690,6 +690,10 @@ fn queue_is_visible_on_wide_layout_and_toggleable_as_a_focus_view() {
 
 fn render_screen(width: u16, height: u16, app: &App) -> String {
     render_screen_with_hits(width, height, app).0
+}
+
+fn is_braille_bar(character: char) -> bool {
+    matches!(character as u32, 0x2840 | 0x2844 | 0x2846 | 0x2847)
 }
 
 fn render_screen_with_hits(width: u16, height: u16, app: &App) -> (String, zerobeat_tui::HitMap) {
