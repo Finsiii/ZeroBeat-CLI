@@ -75,7 +75,7 @@ jobs:
           install -m 644 LICENSE dist/stage/LICENSE
           tar -C dist/stage -czf dist/zerobeat-linux-x86_64.tar.gz \
             zerobeat zerobeatd README.md LICENSE
-          sha256sum dist/zerobeat-linux-x86_64.tar.gz \
+          (cd dist && sha256sum zerobeat-linux-x86_64.tar.gz) \
             > dist/zerobeat-linux-x86_64.tar.gz.sha256
           echo "archive=dist/zerobeat-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/zerobeat-linux-x86_64.tar.gz.sha256" >> "$GITHUB_OUTPUT"

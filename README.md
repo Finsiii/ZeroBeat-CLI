@@ -74,7 +74,7 @@ Download the archive and checksum for a release, then verify before
 extracting:
 
 ```bash
-version=v0.1.0
+version=v0.1.1
 base="https://github.com/Finsiii/ZeroBeat-CLI/releases/download/$version"
 mkdir -p "$HOME/tmp/zerobeat-$version"
 cd "$HOME/tmp/zerobeat-$version"
