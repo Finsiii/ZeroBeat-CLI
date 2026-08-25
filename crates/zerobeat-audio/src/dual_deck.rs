@@ -169,13 +169,12 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
                 return Ok(());
             }
             generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            state.decks[incoming].stop()?;
+            if !should_continue() {
+                return Ok(());
+            }
             #[cfg(target_os = "linux")]
             self.incoming_slot.store(incoming, Ordering::Release);
-            if let Err(error) = state.decks[incoming].stop() {
-                #[cfg(target_os = "linux")]
-                self.incoming_slot.store(usize::MAX, Ordering::Release);
-                return Err(error);
-            }
             if let Err(error) = state.decks[incoming].load(source) {
                 #[cfg(target_os = "linux")]
                 self.incoming_slot.store(usize::MAX, Ordering::Release);
@@ -302,6 +301,22 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
         };
         let target = state.incoming.unwrap_or(state.active);
         state.decks[target].telemetry()
+    }
+
+    fn failed(&self) -> bool {
+        let Ok(state) = self.inner.lock() else {
+            return false;
+        };
+        let target = state.incoming.unwrap_or(state.active);
+        state.decks[target].failed()
+    }
+
+    fn last_error(&self) -> Option<String> {
+        let Ok(state) = self.inner.lock() else {
+            return None;
+        };
+        let target = state.incoming.unwrap_or(state.active);
+        state.decks[target].last_error()
     }
 
     #[cfg(target_os = "linux")]
@@ -497,6 +512,28 @@ mod tests {
             !events.iter().any(|event| event == "b:third:volume:0.004"),
             "stale worker touched the replacement deck: {events:?}"
         );
+    }
+
+    #[test]
+    fn guarded_transition_aborts_after_stopping_the_incoming_deck() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let first = RecordingBackend::new("a", Arc::clone(&events));
+        let second = RecordingBackend::new("b", Arc::clone(&events));
+        let mut mixer = DualDeck::new(first, second);
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+
+        mixer
+            .transition_to_guarded(
+                &StreamSource::new("replacement"),
+                Duration::from_millis(1),
+                &|| checks.fetch_add(1, Ordering::AcqRel) < 2,
+            )
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| event == "b::stop"));
+        assert!(!events.iter().any(|event| event == "b:replacement:load"));
+        assert!(!events.iter().any(|event| event == "b:replacement:play"));
     }
 
     #[test]

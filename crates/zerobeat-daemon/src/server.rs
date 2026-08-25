@@ -14,7 +14,7 @@ use tokio::{
 };
 #[cfg(target_os = "linux")]
 use zerobeat_audio::CancellationController;
-use zerobeat_audio::{AudioBackend, BackendError, StreamSource};
+use zerobeat_audio::{AudioBackend, BackendError, BackendTelemetry, StreamSource};
 use zerobeat_catalog::{
     AudioQuality, CatalogError, CatalogFuture, MusicCatalog, MusicQueue, QueueFuture,
     QueueRepeatMode, QueueSession, QueueStart, ResolvedStream, SearchRequest,
@@ -1401,6 +1401,26 @@ fn commit_playback_current(snapshot: &mut AppSnapshot, track: &Track) {
     }
 }
 
+fn commit_playback_success(
+    snapshot: &mut AppSnapshot,
+    track: &Track,
+    observation: Option<AudioObservation>,
+) {
+    commit_playback_current(snapshot, track);
+    snapshot.playback.status = PlaybackStatus::Playing;
+    snapshot.playback.error = None;
+    if let Some(observation) = observation {
+        if observation.failed {
+            commit_playback_observation(snapshot, observation);
+            clear_stale_playback_telemetry(snapshot, track.duration_ms);
+        } else {
+            commit_fresh_playback_telemetry(snapshot, observation.telemetry);
+        }
+    } else {
+        clear_stale_playback_telemetry(snapshot, track.duration_ms);
+    }
+}
+
 fn snapshot_event(snapshot: AppSnapshot) -> DaemonEvent {
     DaemonEvent::Snapshot(Box::new(snapshot))
 }
@@ -1499,13 +1519,11 @@ fn spawn_playback(
             return;
         }
         match result {
-            PlaybackRun::Completed(Ok(())) => {
+            PlaybackRun::Completed(Ok(observation)) => {
                 if let Some(session) = queue_session.as_ref() {
                     project_queue_for(&playback, &mut snapshot, session);
                 }
-                commit_playback_current(&mut snapshot, &track);
-                snapshot.playback.status = PlaybackStatus::Playing;
-                snapshot.playback.error = None;
+                commit_playback_success(&mut snapshot, &track, Some(observation));
                 if let Ok(database) = storage.lock()
                     && database.record_play(&track, unix_time()).is_ok()
                     && let Ok(library) = library_snapshot(&database)
@@ -1658,7 +1676,7 @@ async fn run_audio(
 }
 
 enum PlaybackRun {
-    Completed(Result<(), String>),
+    Completed(Result<AudioObservation, String>),
     Stale,
 }
 
@@ -1677,11 +1695,17 @@ async fn run_playback_audio(
         }
         operation(audio.as_mut())
             .map_err(|error| error.to_string())
-            .map(Some)
+            .map(|_| {
+                Some(AudioObservation {
+                    telemetry: audio.telemetry(),
+                    failed: audio.failed(),
+                    last_error: audio.last_error(),
+                })
+            })
     })
     .await
     {
-        Ok(Ok(Some(()))) => PlaybackRun::Completed(Ok(())),
+        Ok(Ok(Some(observation))) => PlaybackRun::Completed(Ok(observation)),
         Ok(Ok(None)) => PlaybackRun::Stale,
         Ok(Err(error)) => PlaybackRun::Completed(Err(error)),
         Err(error) => PlaybackRun::Completed(Err(format!("audio worker failed: {error}"))),
@@ -1711,11 +1735,18 @@ async fn refresh_playback_telemetry(
     storage: &SharedStorage,
 ) {
     let state = &playback.state;
-    let telemetry = match audio.try_lock() {
-        Ok(audio) => audio.telemetry(),
-        Err(_) => return,
+    let Some(observation) = read_audio_observation(audio) else {
+        return;
     };
-    let _queue_guard = playback.queue_mutation.lock().await;
+    if observation.failed {
+        let mut snapshot = state.lock().await;
+        commit_playback_observation(&mut snapshot, observation);
+        return;
+    }
+    let Ok(_queue_guard) = playback.queue_mutation.try_lock() else {
+        return;
+    };
+    let telemetry = observation.telemetry;
     if let Some((session_id, session_revision)) = queue_session_info(playback) {
         let current_index = playback
             .queue_current_index
@@ -1762,7 +1793,8 @@ async fn refresh_playback_telemetry(
         }
         let should_advance = {
             let snapshot = state.lock().await;
-            !transition_pending(playback)
+            !audio_failure_pending(audio)
+                && !transition_pending(playback)
                 && snapshot.playback.status == PlaybackStatus::Playing
                 && snapshot.playback.error.is_none()
                 && (telemetry.ended
@@ -1778,8 +1810,14 @@ async fn refresh_playback_telemetry(
         if should_advance
             && auto_advance_allowed(playback, &session_id, session_revision, current_index)
         {
+            if audio_failure_pending(audio) {
+                return;
+            }
             match queue.next_queue(&session_id).await {
                 Ok(session) => {
+                    if audio_failure_pending(audio) {
+                        return;
+                    }
                     let canonical_track_id = session
                         .tracks
                         .get(session.current_index)
@@ -1841,6 +1879,31 @@ async fn refresh_playback_telemetry(
         }
     }
     let mut snapshot = state.lock().await;
+    commit_playback_telemetry(&mut snapshot, Some(telemetry));
+}
+
+struct AudioObservation {
+    telemetry: BackendTelemetry,
+    failed: bool,
+    last_error: Option<String>,
+}
+
+fn read_audio_observation(audio: &SharedAudio) -> Option<AudioObservation> {
+    audio.try_lock().ok().map(|audio| AudioObservation {
+        telemetry: audio.telemetry(),
+        failed: audio.failed(),
+        last_error: audio.last_error(),
+    })
+}
+
+fn audio_failure_pending(audio: &SharedAudio) -> bool {
+    read_audio_observation(audio).is_none_or(|observation| observation.failed)
+}
+
+fn commit_playback_telemetry(snapshot: &mut AppSnapshot, telemetry: Option<BackendTelemetry>) {
+    let Some(telemetry) = telemetry else {
+        return;
+    };
     if matches!(
         snapshot.playback.status,
         PlaybackStatus::Playing | PlaybackStatus::Paused
@@ -1851,6 +1914,52 @@ async fn refresh_playback_telemetry(
         snapshot.playback.spectrum = telemetry.spectrum;
         snapshot.playback.underrun_count = telemetry.underrun_count;
     }
+}
+
+fn commit_fresh_playback_telemetry(snapshot: &mut AppSnapshot, telemetry: BackendTelemetry) {
+    if matches!(
+        snapshot.playback.status,
+        PlaybackStatus::Playing | PlaybackStatus::Paused
+    ) {
+        snapshot.playback.position_ms = telemetry.position_ms;
+        snapshot.playback.duration_ms = telemetry.duration_ms.max(
+            snapshot
+                .playback
+                .current
+                .as_ref()
+                .map_or(0, |track| track.duration_ms),
+        );
+        snapshot.playback.buffered_ms = telemetry.buffered_ms;
+        snapshot.playback.spectrum = telemetry.spectrum;
+        snapshot.playback.underrun_count = telemetry.underrun_count;
+    }
+}
+
+fn commit_playback_observation(snapshot: &mut AppSnapshot, observation: AudioObservation) {
+    if observation.failed {
+        if matches!(
+            snapshot.playback.status,
+            PlaybackStatus::Playing | PlaybackStatus::Paused
+        ) {
+            snapshot.playback.status = PlaybackStatus::Failed;
+            snapshot.playback.error = Some(
+                observation
+                    .last_error
+                    .unwrap_or_else(|| "audio backend failed".into()),
+            );
+            snapshot.playback.spectrum = [0; 24];
+        }
+        return;
+    }
+    commit_playback_telemetry(snapshot, Some(observation.telemetry));
+}
+
+fn clear_stale_playback_telemetry(snapshot: &mut AppSnapshot, duration_ms: u64) {
+    snapshot.playback.position_ms = 0;
+    snapshot.playback.duration_ms = duration_ms;
+    snapshot.playback.buffered_ms = 0;
+    snapshot.playback.spectrum = [0; 24];
+    snapshot.playback.underrun_count = 0;
 }
 
 pub(crate) fn library_snapshot(
@@ -2011,6 +2120,268 @@ async fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerobeat_audio::BackendTelemetry;
+    use zerobeat_protocol::PlaybackSnapshot;
+
+    struct TelemetryBackend {
+        telemetry: BackendTelemetry,
+        failed: bool,
+        last_error: Option<String>,
+    }
+
+    impl AudioBackend for TelemetryBackend {
+        fn load(&mut self, _source: &StreamSource) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn play(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn pause(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn telemetry(&self) -> BackendTelemetry {
+            self.telemetry
+        }
+
+        fn failed(&self) -> bool {
+            self.failed
+        }
+
+        fn last_error(&self) -> Option<String> {
+            self.last_error.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_skips_busy_audio_and_keeps_last_committed_snapshot() {
+        let audio: SharedAudio = Arc::new(StdMutex::new(Box::new(TelemetryBackend {
+            telemetry: BackendTelemetry {
+                position_ms: 900,
+                duration_ms: 5_000,
+                buffered_ms: 1_200,
+                ..BackendTelemetry::default()
+            },
+            failed: false,
+            last_error: None,
+        })));
+        let mut snapshot = AppSnapshot::default();
+        snapshot.playback.status = PlaybackStatus::Playing;
+        snapshot.playback.position_ms = 450;
+
+        let busy_guard = audio.lock().expect("audio lock");
+        let started = Instant::now();
+        let busy = read_audio_observation(&audio);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(busy.is_none());
+        assert_eq!(snapshot.playback.position_ms, 450);
+        drop(busy_guard);
+
+        snapshot.playback.error = Some("existing error".into());
+        let available = read_audio_observation(&audio).expect("available observation");
+        assert_eq!(available.telemetry.position_ms, 900);
+        commit_playback_observation(&mut snapshot, available);
+        assert_eq!(snapshot.playback.position_ms, 900);
+        assert_eq!(snapshot.playback.buffered_ms, 1_200);
+        assert_eq!(snapshot.playback.status, PlaybackStatus::Playing);
+        assert_eq!(snapshot.playback.error.as_deref(), Some("existing error"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_skips_busy_queue_during_transition_without_stale_error() {
+        let playback = PlaybackCoordinator {
+            state: Arc::new(Mutex::new(AppSnapshot {
+                playback: PlaybackSnapshot {
+                    status: PlaybackStatus::Playing,
+                    current: Some(Track::new("current", "Current", "Artist", 5_000)),
+                    position_ms: 450,
+                    error: Some("previous transition failed".into()),
+                    ..PlaybackSnapshot::default()
+                },
+                ..AppSnapshot::default()
+            })),
+            generation: Arc::new(AtomicU64::new(0)),
+            pending_transition: Arc::new(AtomicU64::new(7)),
+            queue_session: Arc::new(StdMutex::new(None)),
+            queue_endless: Arc::new(StdMutex::new(false)),
+            queue_current_index: Arc::new(StdMutex::new(0)),
+            queue_projection: Arc::new(StdMutex::new(None)),
+            queue_refill_marker: Arc::new(StdMutex::new(None)),
+            queue_refill_backoff: Arc::new(StdMutex::new(None)),
+            queue_refill_in_flight: Arc::new(AtomicBool::new(false)),
+            auto_advance_marker: Arc::new(StdMutex::new(None)),
+            queue_mutation: Arc::new(Mutex::new(())),
+            stream_cache: Arc::new(StreamCache::new()),
+            #[cfg(target_os = "linux")]
+            cancellation: None,
+        };
+        let audio: SharedAudio = Arc::new(StdMutex::new(Box::new(TelemetryBackend {
+            telemetry: BackendTelemetry {
+                position_ms: 900,
+                ..BackendTelemetry::default()
+            },
+            failed: false,
+            last_error: None,
+        })));
+        let catalog: Arc<dyn MusicCatalog> = Arc::new(UnavailableCatalog);
+        let queue: Arc<dyn MusicQueue> = Arc::new(UnavailableQueue);
+        let storage = Arc::new(StdMutex::new(Database::open_in_memory().expect("storage")));
+        let queue_guard = playback.queue_mutation.lock().await;
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            refresh_playback_telemetry(&playback, &catalog, &queue, &audio, &storage),
+        )
+        .await
+        .expect("telemetry tick blocked on queue mutation");
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let snapshot = playback.state.lock().await;
+        assert_eq!(snapshot.playback.position_ms, 450);
+        assert_eq!(snapshot.playback.current.as_ref().unwrap().id, "current");
+        assert_eq!(
+            snapshot.playback.error.as_deref(),
+            Some("previous transition failed")
+        );
+        drop(snapshot);
+        drop(queue_guard);
+    }
+
+    #[test]
+    fn terminal_audio_failure_marks_playback_failed_and_preserves_context() {
+        let audio: SharedAudio = Arc::new(StdMutex::new(Box::new(TelemetryBackend {
+            telemetry: BackendTelemetry {
+                position_ms: 900,
+                spectrum: [7; 24],
+                ..BackendTelemetry::default()
+            },
+            failed: true,
+            last_error: Some("decoder exhausted stream".into()),
+        })));
+        let mut snapshot = AppSnapshot::default();
+        snapshot.playback.status = PlaybackStatus::Playing;
+        snapshot.playback.current = Some(Track::new("current", "Current", "Artist", 5_000));
+        snapshot.playback.queue = vec![Track::new("next", "Next", "Artist", 5_000)];
+        snapshot.playback.spectrum = [3; 24];
+
+        let observation = read_audio_observation(&audio).expect("audio observation");
+        commit_playback_observation(&mut snapshot, observation);
+
+        assert_eq!(snapshot.playback.status, PlaybackStatus::Failed);
+        assert_eq!(snapshot.playback.current.as_ref().unwrap().id, "current");
+        assert_eq!(snapshot.playback.queue[0].id, "next");
+        assert_eq!(
+            snapshot.playback.error.as_deref(),
+            Some("decoder exhausted stream")
+        );
+        assert_eq!(snapshot.playback.spectrum, [0; 24]);
+    }
+
+    #[test]
+    fn successful_explicit_play_clears_terminal_audio_error() {
+        let mut snapshot = AppSnapshot::default();
+        snapshot.playback.status = PlaybackStatus::Failed;
+        snapshot.playback.current = Some(Track::new("old", "Old", "Artist", 5_000));
+        snapshot.playback.error = Some("decoder exhausted stream".into());
+        snapshot.playback.position_ms = 22_000;
+        snapshot.playback.duration_ms = 90_000;
+        snapshot.playback.buffered_ms = 30_000;
+        snapshot.playback.spectrum = [3; 24];
+        let track = Track::new("new", "New", "Artist", 5_000);
+
+        commit_playback_success(&mut snapshot, &track, None);
+
+        assert_eq!(snapshot.playback.status, PlaybackStatus::Playing);
+        assert_eq!(snapshot.playback.current.as_ref().unwrap().id, "new");
+        assert_eq!(snapshot.playback.error, None);
+        assert_eq!(snapshot.playback.position_ms, 0);
+        assert_eq!(snapshot.playback.duration_ms, 5_000);
+        assert_eq!(snapshot.playback.buffered_ms, 0);
+        assert_eq!(snapshot.playback.spectrum, [0; 24]);
+    }
+
+    #[test]
+    fn successful_playback_commit_replaces_previous_track_telemetry_atomically() {
+        let mut snapshot = AppSnapshot::default();
+        snapshot.playback.status = PlaybackStatus::Playing;
+        snapshot.playback.current = Some(Track::new("old", "Old", "Artist", 90_000));
+        snapshot.playback.position_ms = 22_000;
+        snapshot.playback.duration_ms = 90_000;
+        snapshot.playback.buffered_ms = 30_000;
+        snapshot.playback.spectrum = [3; 24];
+        snapshot.playback.underrun_count = 4;
+        let track = Track::new("new", "New", "Artist", 60_000);
+        let observation = AudioObservation {
+            telemetry: BackendTelemetry {
+                position_ms: 128,
+                duration_ms: 60_000,
+                buffered_ms: 12_000,
+                spectrum: [9; 24],
+                underrun_count: 1,
+                ..BackendTelemetry::default()
+            },
+            failed: false,
+            last_error: None,
+        };
+
+        commit_playback_success(&mut snapshot, &track, Some(observation));
+
+        assert_eq!(snapshot.playback.current.as_ref().unwrap().id, "new");
+        assert_eq!(snapshot.playback.status, PlaybackStatus::Playing);
+        assert_eq!(snapshot.playback.position_ms, 128);
+        assert_eq!(snapshot.playback.duration_ms, 60_000);
+        assert_eq!(snapshot.playback.buffered_ms, 12_000);
+        assert_eq!(snapshot.playback.spectrum, [9; 24]);
+        assert_eq!(snapshot.playback.underrun_count, 1);
+    }
+
+    #[test]
+    fn terminal_failure_observed_at_success_commit_wins_over_playing_state() {
+        let mut snapshot = AppSnapshot::default();
+        snapshot.playback.current = Some(Track::new("old", "Old", "Artist", 90_000));
+        let track = Track::new("new", "New", "Artist", 60_000);
+        let observation = AudioObservation {
+            telemetry: BackendTelemetry::default(),
+            failed: true,
+            last_error: Some("incoming decoder failed".into()),
+        };
+
+        commit_playback_success(&mut snapshot, &track, Some(observation));
+
+        assert_eq!(snapshot.playback.current.as_ref().unwrap().id, "new");
+        assert_eq!(snapshot.playback.status, PlaybackStatus::Failed);
+        assert_eq!(
+            snapshot.playback.error.as_deref(),
+            Some("incoming decoder failed")
+        );
+        assert_eq!(snapshot.playback.position_ms, 0);
+        assert_eq!(snapshot.playback.duration_ms, 60_000);
+        assert_eq!(snapshot.playback.buffered_ms, 0);
+        assert_eq!(snapshot.playback.spectrum, [0; 24]);
+    }
+
+    #[test]
+    fn auto_advance_rechecks_audio_failure_without_waiting_on_audio_lock() {
+        let audio: SharedAudio = Arc::new(StdMutex::new(Box::new(TelemetryBackend {
+            telemetry: BackendTelemetry::default(),
+            failed: true,
+            last_error: Some("decoder failed".into()),
+        })));
+        assert!(audio_failure_pending(&audio));
+
+        let guard = audio.lock().expect("audio lock");
+        let started = Instant::now();
+        assert!(audio_failure_pending(&audio));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        drop(guard);
+    }
+
     fn session(revision: i64, shuffle: bool) -> QueueSession {
         let tracks = (0..16)
             .map(|index| Track::new(index.to_string(), format!("Track {index}"), "Artist", 1_000))

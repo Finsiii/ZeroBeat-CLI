@@ -289,42 +289,24 @@ fn centered(frame: &mut Frame, area: Rect, line: Line<'_>) {
 
 fn spectrum_rows(spectrum: &[u8; 24], available_width: u16) -> Vec<String> {
     const ROWS: usize = 5;
-    const PARTIAL: [char; 4] = [' ', '▂', '▄', '▆'];
-    let width = usize::from(available_width.saturating_sub(8).clamp(16, 88));
-    if spectrum.iter().all(|value| *value == 0) {
-        let mut rows = vec![String::new(); ROWS];
-        rows[ROWS - 1] = "─".repeat(width);
-        return rows;
+    const BAR_COUNT: usize = 24;
+    const SLOT_WIDTH: usize = 2;
+    const WIDTH: usize = BAR_COUNT * SLOT_WIDTH - 1;
+
+    let mut rows = vec![vec![' '; WIDTH]; ROWS];
+    rows[ROWS - 1].fill('─');
+    for (band, value) in spectrum.iter().enumerate() {
+        let height = (usize::from((*value).min(100)) * (ROWS - 1)).div_ceil(100);
+        let column = band * SLOT_WIDTH;
+        for level in 0..height {
+            rows[ROWS - 2 - level][column] = '█';
+        }
     }
-
-    let values = (0..width)
-        .map(|column| {
-            let scaled = column * (spectrum.len() - 1);
-            let left = scaled / width.saturating_sub(1).max(1);
-            let right = (left + 1).min(spectrum.len() - 1);
-            let remainder = scaled % width.saturating_sub(1).max(1);
-            let span = width.saturating_sub(1).max(1);
-            (usize::from(spectrum[left]) * (span - remainder)
-                + usize::from(spectrum[right]) * remainder)
-                / span
-        })
-        .collect::<Vec<_>>();
-
-    (0..ROWS)
-        .map(|row| {
-            values
-                .iter()
-                .map(|value| {
-                    let units = value.saturating_mul(ROWS * 4) / 100;
-                    let threshold = (ROWS - row - 1) * 4;
-                    if units >= threshold + 4 {
-                        '█'
-                    } else {
-                        PARTIAL[units.saturating_sub(threshold).min(PARTIAL.len() - 1)]
-                    }
-                })
-                .collect()
-        })
+    let output_width = usize::from(available_width).min(WIDTH);
+    let crop_start = WIDTH.saturating_sub(output_width) / 2;
+    let crop_end = crop_start + output_width;
+    rows.into_iter()
+        .map(|row| row[crop_start..crop_end].iter().collect())
         .collect()
 }
 
@@ -338,12 +320,73 @@ mod tests {
     use super::spectrum_rows;
 
     #[test]
-    fn resampling_preserves_distinct_native_peak_locations() {
+    fn spectrum_bars_keep_fixed_columns_when_amplitude_changes() {
         let mut low = [0; 24];
-        low[2] = 100;
+        low[2] = 25;
         let mut high = [0; 24];
-        high[21] = 100;
+        high[2] = 100;
 
-        assert_ne!(spectrum_rows(&low, 80), spectrum_rows(&high, 80));
+        let low_columns = active_columns(&spectrum_rows(&low, 80));
+        let high_columns = active_columns(&spectrum_rows(&high, 80));
+
+        assert_eq!(low_columns, high_columns);
+        assert_eq!(low_columns.len(), 1);
+        assert_eq!(low_columns[0], 4);
+    }
+
+    #[test]
+    fn isolated_band_does_not_spread_horizontally() {
+        let mut spectrum = [0; 24];
+        spectrum[12] = 100;
+
+        let columns = active_columns(&spectrum_rows(&spectrum, 80));
+
+        assert_eq!(columns, vec![24]);
+    }
+
+    #[test]
+    fn narrow_spectrum_crops_symmetrically_without_resampling_bars() {
+        let rows = spectrum_rows(&[100; 24], 36);
+
+        assert!(rows.iter().all(|row| row.chars().count() == 36));
+        assert_eq!(
+            active_columns(&rows),
+            (0..18).map(|column| column * 2 + 1).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn narrow_isolated_band_keeps_a_fixed_x_position_across_amplitude() {
+        let mut low = [0; 24];
+        low[12] = 25;
+        let mut high = [0; 24];
+        high[12] = 100;
+
+        let low_columns = active_columns(&spectrum_rows(&low, 36));
+        let high_columns = active_columns(&spectrum_rows(&high, 36));
+
+        assert_eq!(low_columns, high_columns);
+        assert_eq!(low_columns, vec![19]);
+    }
+
+    #[test]
+    fn zero_spectrum_is_a_stable_horizontal_baseline() {
+        let rows = spectrum_rows(&[0; 24], 80);
+
+        assert_eq!(rows.len(), 5);
+        assert!(rows[..4].iter().all(|row| row.chars().all(|c| c == ' ')));
+        assert!(rows[4].chars().all(|c| c == '─'));
+    }
+
+    fn active_columns(rows: &[String]) -> Vec<usize> {
+        rows.iter()
+            .flat_map(|row| {
+                row.chars()
+                    .enumerate()
+                    .filter_map(|(column, character)| (character == '█').then_some(column))
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 }

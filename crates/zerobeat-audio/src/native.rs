@@ -98,6 +98,21 @@ impl NativeEngine {
         non_negative(unsafe { zb_engine_get_underrun_count(self.raw.as_ptr()) })
     }
 
+    pub fn failed(&self) -> bool {
+        unsafe { zb_engine_has_failed(self.raw.as_ptr()) != 0 }
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        let message = unsafe { zb_engine_get_last_error(self.raw.as_ptr()) };
+        (!message.is_null())
+            .then(|| {
+                unsafe { CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|message| !message.is_empty())
+    }
+
     pub fn spectrum(&self) -> [u8; SPECTRUM_BAND_COUNT] {
         let mut bands = [0; SPECTRUM_BAND_COUNT];
         let result = unsafe {
@@ -240,6 +255,14 @@ impl AudioBackend for NativeEngine {
         }
     }
 
+    fn failed(&self) -> bool {
+        NativeEngine::failed(self)
+    }
+
+    fn last_error(&self) -> Option<String> {
+        NativeEngine::last_error(self)
+    }
+
     fn cancellation_handle(&self) -> Option<NativeCancellationHandle> {
         NativeEngine::cancellation_handle(self)
     }
@@ -296,6 +319,7 @@ unsafe extern "C" {
     fn zb_engine_get_duration_ms(engine: *mut ZbEngine) -> i64;
     fn zb_engine_get_buffered_ms(engine: *mut ZbEngine) -> i64;
     fn zb_engine_get_underrun_count(engine: *mut ZbEngine) -> i64;
+    fn zb_engine_has_failed(engine: *mut ZbEngine) -> c_int;
     fn zb_engine_get_spectrum(engine: *mut ZbEngine, bands: *mut u8, band_count: c_int) -> c_int;
     fn zb_engine_analyze_spectrum(
         samples: *const f32,

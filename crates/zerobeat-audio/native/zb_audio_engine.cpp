@@ -166,7 +166,7 @@ struct zb_biquad_filter {
 };
 
 struct zb_decode_cancel {
-  std::atomic<bool> requested{false};
+  std::atomic<uint64_t> generation{0};
   std::atomic<uint32_t> references{1};
 };
 
@@ -180,8 +180,10 @@ struct zb_engine {
   std::atomic<int64_t> buffered_ms{0};
   std::atomic<float> volume{1.0f};
   std::atomic<bool> decode_stop{false};
+  std::atomic<uint64_t> decode_cancel_generation{0};
   std::atomic<bool> decode_eof{false};
   std::atomic<bool> decode_failed{false};
+  std::atomic<uint64_t> decode_activity{0};
   std::atomic<int64_t> decoded_frames{0};
   std::atomic<int64_t> underrun_count{0};
   std::atomic<int64_t> ring_buffer_capacity_frames{0};
@@ -199,7 +201,6 @@ struct zb_engine {
   std::array<std::atomic<uint64_t>, ZB_SPECTRUM_CAPTURE_BUFFERS>
       spectrum_buffer_generations{};
   std::atomic<uint64_t> spectrum_generation{0};
-  std::atomic<uint64_t> spectrum_signal{0};
   std::atomic<bool> spectrum_stop{false};
   size_t spectrum_write_buffer = 0;
   size_t spectrum_write_index = 0;
@@ -240,8 +241,10 @@ constexpr int32_t ZB_PREBUFFER_FRAMES = (ZB_SAMPLE_RATE * 3) / 4;
 constexpr int32_t ZB_PREBUFFER_MIN_FRAMES = ZB_SAMPLE_RATE / 4;
 constexpr int32_t ZB_PREBUFFER_SOFT_TIMEOUT_MS = 5000;
 constexpr int32_t ZB_PREBUFFER_HARD_TIMEOUT_MS = 12000;
-constexpr int32_t ZB_PREBUFFER_NO_PROGRESS_MS = 2000;
+constexpr int32_t ZB_PREBUFFER_NO_PROGRESS_MS = 5000;
 constexpr int32_t ZB_PREBUFFER_POLL_MS = 1;
+constexpr int32_t ZB_DEVICE_PERIOD_MS = 20;
+constexpr int32_t ZB_DEVICE_PERIODS = 3;
 constexpr int32_t ZB_RING_FULL_SLEEP_MS = 10;
 constexpr int32_t ZB_SILENCE_WINDOW_MS = 100;
 constexpr int32_t ZB_SILENCE_WINDOW_FRAMES =
@@ -251,9 +254,18 @@ constexpr int64_t ZB_FFMPEG_PROBE_SIZE_BYTES = 64 * 1024;
 constexpr int64_t ZB_FFMPEG_MAX_ANALYZE_DURATION_US = 500 * 1000;
 constexpr int32_t ZB_FFMPEG_MAX_PROBE_PACKETS = 32;
 constexpr int64_t ZB_HTTP_RANGE_BYTES = 512 * 1024;
+constexpr int32_t ZB_HTTP_RANGE_MAX_ATTEMPTS = 4;
+constexpr int32_t ZB_HTTP_RETRY_BASE_MS = 25;
+constexpr int32_t ZB_SPECTRUM_POLL_MS = 2;
 constexpr int64_t ZB_CONCEALMENT_HOLD_FRAMES = ZB_SAMPLE_RATE / 200;
 constexpr int64_t ZB_CONCEALMENT_FADE_FRAMES = ZB_SAMPLE_RATE / 20;
 constexpr double ZB_TAU = 6.28318530717958647692;
+
+static_assert(ZB_DEVICE_PERIOD_MS >= 10 && ZB_DEVICE_PERIOD_MS <= 40);
+static_assert(ZB_DEVICE_PERIODS >= 2 && ZB_DEVICE_PERIODS <= 4);
+static_assert(ZB_HTTP_RANGE_MAX_ATTEMPTS >= 1 && ZB_HTTP_RANGE_MAX_ATTEMPTS <= 5);
+static_assert(ZB_HTTP_RETRY_BASE_MS >= 1 && ZB_HTTP_RETRY_BASE_MS <= 250);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
 int32_t analyze_spectrum_pcm(const float *samples, int64_t frame_count,
                              int32_t channels, uint8_t *bands,
@@ -384,9 +396,6 @@ void capture_spectrum(zb_engine *engine, const float *frames,
         std::memory_order_relaxed);
     engine->spectrum_buffer_states[completed].store(ZB_SPECTRUM_BUFFER_READY,
                                                     std::memory_order_release);
-    engine->spectrum_signal.fetch_add(1, std::memory_order_release);
-    engine->spectrum_signal.notify_one();
-
     bool found = false;
     for (size_t candidate = 0; candidate < ZB_SPECTRUM_CAPTURE_BUFFERS;
          ++candidate) {
@@ -421,7 +430,6 @@ void capture_spectrum(zb_engine *engine, const float *frames,
 
 void analyze_spectrum_worker(zb_engine *engine) {
   while (!engine->spectrum_stop.load(std::memory_order_acquire)) {
-    const auto signal = engine->spectrum_signal.load(std::memory_order_acquire);
     bool analyzed = false;
     for (size_t index = 0; index < ZB_SPECTRUM_CAPTURE_BUFFERS; ++index) {
       uint8_t expected = ZB_SPECTRUM_BUFFER_READY;
@@ -454,7 +462,7 @@ void analyze_spectrum_worker(zb_engine *engine) {
       analyzed = true;
     }
     if (!analyzed && !engine->spectrum_stop.load(std::memory_order_acquire)) {
-      engine->spectrum_signal.wait(signal, std::memory_order_acquire);
+      std::this_thread::sleep_for(std::chrono::milliseconds(ZB_SPECTRUM_POLL_MS));
     }
   }
 }
@@ -474,14 +482,19 @@ struct http_range_input {
   int64_t chunk_start = -1;
   int64_t total_size = -1;
   int64_t response_start = -1;
+  int64_t response_end = -1;
   int64_t response_total = -1;
   bool total_size_from_url = false;
   std::string error;
   CURL *curl = nullptr;
   curl_slist *request_headers = nullptr;
   const zb_decode_cancel *cancel = nullptr;
+  uint64_t cancel_generation = 0;
+  const std::atomic<bool> *stop = nullptr;
   size_t max_chunk_bytes = 0;
   bool body_limit_exceeded = false;
+  bool retryable_failure = false;
+  std::atomic<uint64_t> *activity = nullptr;
 
   ~http_range_input() {
     curl_slist_free_all(request_headers);
@@ -491,10 +504,17 @@ struct http_range_input {
   }
 };
 
+bool http_cancel_requested(const http_range_input *input) {
+  return (input->stop != nullptr &&
+          input->stop->load(std::memory_order_acquire)) ||
+         (input->cancel != nullptr &&
+          input->cancel->generation.load(std::memory_order_acquire) !=
+              input->cancel_generation);
+}
+
 size_t append_http_body(char *data, size_t size, size_t count, void *opaque) {
   auto *input = static_cast<http_range_input *>(opaque);
-  if (input->cancel != nullptr &&
-      input->cancel->requested.load(std::memory_order_acquire)) {
+  if (http_cancel_requested(input)) {
     return 0;
   }
   if (count != 0 && size > std::numeric_limits<size_t>::max() / count) {
@@ -516,10 +536,10 @@ size_t append_http_body(char *data, size_t size, size_t count, void *opaque) {
 int curl_progress(void *opaque, curl_off_t, curl_off_t, curl_off_t,
                   curl_off_t) {
   const auto *input = static_cast<const http_range_input *>(opaque);
-  return input->cancel != nullptr &&
-                 input->cancel->requested.load(std::memory_order_acquire)
-             ? 1
-             : 0;
+  if (input->activity != nullptr) {
+    input->activity->fetch_add(1, std::memory_order_relaxed);
+  }
+  return http_cancel_requested(input) ? 1 : 0;
 }
 
 size_t inspect_http_header(char *data, size_t size, size_t count,
@@ -544,9 +564,11 @@ size_t inspect_http_header(char *data, size_t size, size_t count,
   try {
     input->response_start =
         std::stoll(line.substr(range_start, dash - range_start));
+    input->response_end = std::stoll(line.substr(dash + 1, slash - dash - 1));
     input->response_total = std::stoll(line.substr(slash + 1));
   } catch (const std::exception &) {
     input->response_start = -1;
+    input->response_end = -1;
   }
   return bytes;
 }
@@ -628,7 +650,7 @@ std::string url_with_range(const std::string &url, const std::string &range) {
   return url.substr(0, query_end) + "&range=" + range + url.substr(query_end);
 }
 
-bool fetch_http_range(http_range_input *input, int64_t start) {
+bool fetch_http_range_once(http_range_input *input, int64_t start) {
   static std::once_flag curl_once;
   static CURLcode curl_init_result = CURLE_FAILED_INIT;
   std::call_once(curl_once, [] {
@@ -664,6 +686,13 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
     curl_easy_setopt(input->curl, CURLOPT_HEADERFUNCTION, inspect_http_header);
     curl_easy_setopt(input->curl, CURLOPT_HEADERDATA, input);
   }
+  if (start < 0 || start > std::numeric_limits<int64_t>::max() -
+                           (ZB_HTTP_RANGE_BYTES - 1) ||
+      (input->total_size > 0 && start >= input->total_size)) {
+    input->error = "invalid HTTP range start";
+    input->retryable_failure = false;
+    return false;
+  }
   const auto natural_end = start + ZB_HTTP_RANGE_BYTES - 1;
   const auto end = input->total_size > 0
                        ? std::min(natural_end, input->total_size - 1)
@@ -676,8 +705,10 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
   input->max_chunk_bytes = static_cast<size_t>(end - start + 1);
   input->body_limit_exceeded = false;
   input->response_start = -1;
+  input->response_end = -1;
   input->response_total = -1;
   input->error.clear();
+  input->retryable_failure = false;
   curl_easy_setopt(input->curl, CURLOPT_RANGE,
                    input->total_size_from_url ? nullptr : range.c_str());
   curl_easy_setopt(input->curl, CURLOPT_URL, ranged_url.c_str());
@@ -685,6 +716,13 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
   long status = 0;
   curl_easy_getinfo(input->curl, CURLINFO_RESPONSE_CODE, &status);
 
+  const auto retryable_status = status == 408 || status == 425 || status == 429 ||
+                                (status >= 500 && status <= 599);
+  if (retryable_status) {
+    input->error = "HTTP status " + std::to_string(status);
+    input->retryable_failure = true;
+    return false;
+  }
   if (input->body_limit_exceeded) {
     input->error = "HTTP response exceeded requested byte range";
     return false;
@@ -692,6 +730,16 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
 
   if (result != CURLE_OK) {
     input->error = curl_easy_strerror(result);
+    input->retryable_failure = result == CURLE_COULDNT_CONNECT ||
+                               result == CURLE_COULDNT_RESOLVE_HOST ||
+                               result == CURLE_COULDNT_RESOLVE_PROXY ||
+                               result == CURLE_GOT_NOTHING ||
+                               result == CURLE_OPERATION_TIMEDOUT ||
+                               result == CURLE_PARTIAL_FILE ||
+                               result == CURLE_RECV_ERROR ||
+                               result == CURLE_SEND_ERROR ||
+                               result == CURLE_HTTP2 ||
+                               result == CURLE_AGAIN;
     return false;
   }
   if (status != 206 &&
@@ -699,12 +747,19 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
     input->error = "HTTP status " + std::to_string(status);
     return false;
   }
-  if (status == 200 && start > 0 && input->response_start != start) {
+  if (status == 200 && start > 0 && !input->total_size_from_url &&
+      input->response_start != start) {
     input->error = "HTTP 200 response is missing the requested Content-Range offset";
     return false;
   }
-  if (status == 206 && input->response_start < 0) {
+  if (status == 206 && (input->response_start < 0 || input->response_end < 0)) {
     input->error = "HTTP 206 response is missing Content-Range";
+    return false;
+  }
+  if (input->response_start >= 0 &&
+      (input->response_end < input->response_start ||
+       input->response_total <= input->response_end)) {
+    input->error = "invalid HTTP Content-Range";
     return false;
   }
   if (input->response_start >= 0 && input->response_start != start) {
@@ -721,7 +776,18 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
   }
   if (input->chunk.empty()) {
     input->error = "empty HTTP range response";
+    input->retryable_failure = true;
     return false;
+  }
+  if (input->response_start >= 0) {
+    const auto response_length =
+        static_cast<uint64_t>(input->response_end) -
+        static_cast<uint64_t>(input->response_start) + 1;
+    if (response_length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        response_length != input->chunk.size()) {
+      input->error = "HTTP Content-Range length mismatch";
+      return false;
+    }
   }
   const auto expected = end - start + 1;
   if (static_cast<int64_t>(input->chunk.size()) > expected) {
@@ -732,6 +798,7 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
       static_cast<int64_t>(input->chunk.size()) < expected &&
       start + static_cast<int64_t>(input->chunk.size()) < input->total_size) {
     input->error = "short HTTP range response";
+    input->retryable_failure = true;
     return false;
   }
   if (status == 200 && input->total_size < 0) {
@@ -739,6 +806,39 @@ bool fetch_http_range(http_range_input *input, int64_t start) {
   }
   input->chunk_start = start;
   return true;
+}
+
+bool fetch_http_range(http_range_input *input, int64_t start) {
+  std::string first_error;
+  for (int32_t attempt = 0; attempt < ZB_HTTP_RANGE_MAX_ATTEMPTS; ++attempt) {
+    if (http_cancel_requested(input)) {
+      input->error = "HTTP request cancelled";
+      input->retryable_failure = false;
+      return false;
+    }
+    if (fetch_http_range_once(input, start)) {
+      return true;
+    }
+    if (first_error.empty()) {
+      first_error = input->error;
+    }
+    if (!input->retryable_failure || attempt + 1 == ZB_HTTP_RANGE_MAX_ATTEMPTS) {
+      if (!first_error.empty() && first_error != input->error) {
+        input->error = first_error + "; final retry: " + input->error;
+      }
+      return false;
+    }
+    const auto delay_ms = ZB_HTTP_RETRY_BASE_MS * (1 << attempt);
+    for (int32_t elapsed = 0; elapsed < delay_ms; ++elapsed) {
+      if (http_cancel_requested(input)) {
+        input->error = "HTTP request cancelled";
+        input->retryable_failure = false;
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  return false;
 }
 
 int read_http_range(void *opaque, uint8_t *buffer, int buffer_size) {
@@ -786,10 +886,18 @@ int64_t seek_http_range(void *opaque, int64_t offset, int whence) {
   whence &= ~AVSEEK_FORCE;
   int64_t target = offset;
   if (whence == SEEK_CUR) {
+    if ((offset > 0 && input->position > std::numeric_limits<int64_t>::max() - offset) ||
+        (offset < 0 && input->position < std::numeric_limits<int64_t>::min() - offset)) {
+      return AVERROR(EINVAL);
+    }
     target = input->position + offset;
   } else if (whence == SEEK_END) {
     if (input->total_size < 0 && !fetch_http_range(input, input->position)) {
       return AVERROR(EIO);
+    }
+    if ((offset > 0 && input->total_size > std::numeric_limits<int64_t>::max() - offset) ||
+        (offset < 0 && input->total_size < std::numeric_limits<int64_t>::min() - offset)) {
+      return AVERROR(EINVAL);
     }
     target = input->total_size + offset;
   } else if (whence != SEEK_SET) {
@@ -820,6 +928,7 @@ void clear_error(zb_engine *engine) {
   std::lock_guard<std::mutex> lock(engine->error_mutex);
   engine->last_error.clear();
   engine->decode_failed.store(false);
+  engine->decode_activity.store(0);
 }
 
 int32_t set_error(zb_engine *engine, const std::string &message, int32_t code) {
@@ -829,7 +938,16 @@ int32_t set_error(zb_engine *engine, const std::string &message, int32_t code) {
       engine->last_error = message;
     }
     engine->decode_failed.store(true);
-    engine->state.store(ZB_STATE_ERROR);
+    const auto current = engine->state.load(std::memory_order_acquire);
+    const auto buffered = engine->pcm_rb_initialized
+                              ? ma_pcm_rb_available_read(&engine->pcm_rb)
+                              : 0;
+    const auto preserve_playable_state =
+        code == ZB_ERR_DECODE && buffered > 0 &&
+        (current == ZB_STATE_PLAYING || current == ZB_STATE_PAUSED);
+    if (!preserve_playable_state) {
+      engine->state.store(ZB_STATE_ERROR, std::memory_order_release);
+    }
   }
   return code;
 }
@@ -845,7 +963,8 @@ bool is_released_or_null(zb_engine *engine) {
 bool decode_requested(const zb_engine *engine) {
   return engine == nullptr || engine->decode_stop.load(std::memory_order_acquire) ||
          (engine->decode_cancel != nullptr &&
-          engine->decode_cancel->requested.load(std::memory_order_acquire));
+          engine->decode_cancel->generation.load(std::memory_order_acquire) !=
+              engine->decode_cancel_generation.load(std::memory_order_acquire));
 }
 
 void request_decode_cancel(zb_engine *engine) {
@@ -853,9 +972,6 @@ void request_decode_cancel(zb_engine *engine) {
     return;
   }
   engine->decode_stop.store(true, std::memory_order_release);
-  if (engine->decode_cancel != nullptr) {
-    engine->decode_cancel->requested.store(true, std::memory_order_release);
-  }
 }
 
 void retain_decode_cancel(zb_decode_cancel *cancel) {
@@ -934,9 +1050,6 @@ void reset_stream_locked(zb_engine *engine) {
   stop_decode_thread(engine);
   uninit_ring_buffer(engine);
   engine->decode_stop.store(false);
-  if (engine->decode_cancel != nullptr) {
-    engine->decode_cancel->requested.store(false, std::memory_order_release);
-  }
   engine->decode_eof.store(false);
   engine->decode_failed.store(false);
   engine->decoded_frames.store(0);
@@ -1236,6 +1349,10 @@ void decode_file_worker(zb_engine *engine, std::string path, int64_t start_ms) {
   if (is_http) {
     http_input.url = path;
     http_input.cancel = engine->decode_cancel;
+    http_input.cancel_generation =
+        engine->decode_cancel_generation.load(std::memory_order_acquire);
+    http_input.stop = &engine->decode_stop;
+    http_input.activity = &engine->decode_activity;
     http_input.total_size = content_length_from_url(path);
     http_input.total_size_from_url = http_input.total_size > 0;
     http_input.headers = engine->http_headers;
@@ -1439,6 +1556,7 @@ void decode_file_worker(zb_engine *engine, std::string path, int64_t start_ms) {
   int read_result = AVERROR_EOF;
   while (!decode_requested(engine) &&
          (read_result = av_read_frame(format, packet)) >= 0) {
+    engine->decode_activity.fetch_add(1, std::memory_order_release);
     if (packet->stream_index == stream_index) {
       result = avcodec_send_packet(codec_context, packet);
       av_packet_unref(packet);
@@ -1464,8 +1582,11 @@ void decode_file_worker(zb_engine *engine, std::string path, int64_t start_ms) {
     if (read_result != AVERROR_EOF) {
       cleanup_ffmpeg(&packet, &frame, &swr, &output_layout, &codec_context,
                      &format, &custom_io);
-      set_error(engine, "av_read_frame failed: " + ffmpeg_error(read_result),
-                ZB_ERR_DECODE);
+      auto detail = ffmpeg_error(read_result);
+      if (!http_input.error.empty()) {
+        detail += " (" + http_input.error + ")";
+      }
+      set_error(engine, "av_read_frame failed: " + detail, ZB_ERR_DECODE);
       return;
     }
     avcodec_send_packet(codec_context, nullptr);
@@ -1498,6 +1619,7 @@ int32_t wait_for_prebuffer(zb_engine *engine) {
   auto last_progress = started;
   int64_t previous_available = -1;
   int64_t previous_decoded = -1;
+  uint64_t previous_activity = 0;
   while (std::chrono::steady_clock::now() < hard_deadline) {
     if (decode_requested(engine)) {
       stop_decode_thread(engine);
@@ -1519,9 +1641,12 @@ int32_t wait_for_prebuffer(zb_engine *engine) {
       return ZB_OK;
     }
     const auto decoded = engine->decoded_frames.load();
-    if (available != previous_available || decoded != previous_decoded) {
+    const auto activity = engine->decode_activity.load(std::memory_order_acquire);
+    if (available != previous_available || decoded != previous_decoded ||
+        activity != previous_activity) {
       previous_available = available;
       previous_decoded = decoded;
+      previous_activity = activity;
       last_progress = std::chrono::steady_clock::now();
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1529,7 +1654,7 @@ int32_t wait_for_prebuffer(zb_engine *engine) {
         (available >= ZB_PREBUFFER_MIN_FRAMES || decoded > 0)) {
       return ZB_OK;
     }
-    if (now - last_progress >=
+    if (activity != 0 && now - last_progress >=
         std::chrono::milliseconds(ZB_PREBUFFER_NO_PROGRESS_MS)) {
       stop_decode_thread(engine);
       return set_error(engine, "native decode made no prebuffer progress",
@@ -1546,11 +1671,9 @@ int32_t wait_for_prebuffer(zb_engine *engine) {
 int32_t start_decode_worker(zb_engine *engine, const std::string &path,
                             int64_t start_ms) {
   engine->decode_stop.store(false);
-  if (engine->decode_cancel != nullptr) {
-    engine->decode_cancel->requested.store(false, std::memory_order_release);
-  }
   engine->decode_eof.store(false);
   engine->decode_failed.store(false);
+  engine->decode_activity.store(0);
   engine->decoded_frames.store(frames_from_ms(start_ms));
   engine->buffered_ms.store(start_ms);
   engine->cursor_frames.store(frames_from_ms(start_ms));
@@ -1715,8 +1838,12 @@ void audio_output_callback(ma_device *device, void *output, const void *,
     engine->cursor_frames.store(cursor);
     const auto ended = engine->decode_eof.load() &&
                        ma_pcm_rb_available_read(&engine->pcm_rb) == 0;
+    const auto failed = engine->decode_failed.load() &&
+                        ma_pcm_rb_available_read(&engine->pcm_rb) == 0;
     if (ended) {
       engine->state.store(ZB_STATE_ENDED);
+    } else if (failed) {
+      engine->state.store(ZB_STATE_ERROR);
     }
     capture_spectrum(engine, frames, frame_count);
     if (ended) {
@@ -1759,6 +1886,9 @@ int32_t init_output_device(zb_engine *engine) {
   config.playback.format = ma_format_f32;
   config.playback.channels = ZB_CHANNELS;
   config.sampleRate = ZB_SAMPLE_RATE;
+  config.periodSizeInMilliseconds = ZB_DEVICE_PERIOD_MS;
+  config.periods = ZB_DEVICE_PERIODS;
+  config.performanceProfile = ma_performance_profile_conservative;
   config.dataCallback = audio_output_callback;
   config.pUserData = engine;
 
@@ -1785,6 +1915,11 @@ int32_t open_decoded_source(zb_engine *engine, const char *source,
   }
 
   std::lock_guard<std::mutex> lock(engine->control_mutex);
+  if (engine->decode_cancel != nullptr) {
+    engine->decode_cancel_generation.store(
+        engine->decode_cancel->generation.load(std::memory_order_acquire),
+        std::memory_order_release);
+  }
   reset_stream_locked(engine);
   clear_error(engine);
 
@@ -1848,8 +1983,6 @@ void zb_engine_destroy(zb_engine *engine) {
     reset_stream_locked(engine);
   }
   engine->spectrum_stop.store(true, std::memory_order_release);
-  engine->spectrum_signal.fetch_add(1, std::memory_order_release);
-  engine->spectrum_signal.notify_one();
   if (engine->spectrum_thread.joinable()) {
     engine->spectrum_thread.join();
   }
@@ -1877,7 +2010,7 @@ void zb_decode_cancel_release(zb_decode_cancel *cancel) {
 
 void zb_decode_cancel_request(zb_decode_cancel *cancel) {
   if (cancel != nullptr) {
-    cancel->requested.store(true, std::memory_order_release);
+    cancel->generation.fetch_add(1, std::memory_order_acq_rel);
   }
 }
 
@@ -1955,7 +2088,13 @@ int32_t zb_engine_play(zb_engine *engine) {
     state = ZB_STATE_READY;
   }
 
-  if (state == ZB_STATE_READY || state == ZB_STATE_PAUSED) {
+  const auto buffered_frames =
+      engine->pcm_rb_initialized ? ma_pcm_rb_available_read(&engine->pcm_rb) : 0;
+  const auto failed_with_buffer =
+      state == ZB_STATE_ERROR && engine->decode_failed.load() &&
+      engine->pcm_rb_initialized && buffered_frames >= ZB_PREBUFFER_MIN_FRAMES;
+  if (state == ZB_STATE_READY || state == ZB_STATE_PAUSED ||
+      failed_with_buffer) {
     if (!engine->device_initialized) {
       const auto init_result = init_output_device(engine);
       if (init_result != ZB_OK)
@@ -1968,6 +2107,9 @@ int32_t zb_engine_play(zb_engine *engine) {
                        ZB_ERR_DEVICE);
     }
     return ZB_OK;
+  }
+  if (state == ZB_STATE_ERROR && engine->decode_failed.load()) {
+    return ZB_ERR_DECODE;
   }
   return set_error(engine, "play called before audio is ready",
                    ZB_ERR_INVALID_ARGUMENT);
@@ -2145,6 +2287,10 @@ int64_t zb_engine_get_ffmpeg_max_analyze_duration_us(zb_engine *engine) {
 
 int64_t zb_engine_get_underrun_count(zb_engine *engine) {
   return engine == nullptr ? 0 : engine->underrun_count.load();
+}
+
+int32_t zb_engine_has_failed(zb_engine *engine) {
+  return engine != nullptr && engine->state.load() == ZB_STATE_ERROR ? 1 : 0;
 }
 
 int32_t zb_engine_get_spectrum(zb_engine *engine, uint8_t *bands,

@@ -89,6 +89,71 @@ fn native_engine_sends_stream_specific_http_headers() {
 }
 
 #[test]
+fn native_engine_allows_slow_initial_http_probe_when_the_request_is_progressing() {
+    let body = silent_wav(1_000);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = connection.read(&mut request).unwrap();
+        let end = body.len() - 1;
+        write!(
+            connection,
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+            body.len(),
+            end,
+            body.len()
+        )
+        .unwrap();
+        for chunk in body.chunks(65_536) {
+            if connection.write_all(chunk).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(800));
+        }
+    });
+
+    let mut engine = NativeEngine::new().unwrap();
+    engine
+        .load(&StreamSource::new(format!("http://{address}/audio")))
+        .unwrap();
+    engine.stop().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn native_engine_tolerates_a_multi_second_upstream_pause_before_audio_resumes() {
+    let body = silent_wav(2_000);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = connection.read(&mut request).unwrap();
+        let end = body.len() - 1;
+        write!(
+            connection,
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+            body.len(),
+            end,
+            body.len()
+        )
+        .unwrap();
+        connection.write_all(&body[..44]).unwrap();
+        std::thread::sleep(Duration::from_millis(3_200));
+        let _ = connection.write_all(&body[44..]);
+    });
+
+    let mut engine = NativeEngine::new().unwrap();
+    engine
+        .load(&StreamSource::new(format!("http://{address}/audio")))
+        .unwrap();
+    engine.stop().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn native_engine_rejects_a_server_that_ignores_the_http_range_cap() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -121,6 +186,273 @@ fn native_engine_rejects_a_server_that_ignores_the_http_range_cap() {
 }
 
 #[test]
+fn native_engine_starts_from_valid_prebuffer_when_a_later_range_fails() {
+    let body = silent_wav(5_000);
+    let body_len = body.len();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let failure_requested = Arc::new(AtomicBool::new(false));
+    let release_failure = Arc::new(AtomicBool::new(false));
+    let failure_sent = Arc::new(AtomicBool::new(false));
+    let server_failure_requested = Arc::clone(&failure_requested);
+    let server_release_failure = Arc::clone(&release_failure);
+    let server_failure_sent = Arc::clone(&failure_sent);
+    let server = std::thread::spawn(move || {
+        let mut failure_released = false;
+        for _ in 0..8 {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read = connection.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let range = request
+                .split("range=")
+                .nth(1)
+                .and_then(|value| value.split(['&', ' ', '\r', '\n']).next())
+                .and_then(|value| value.split('-').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if range == 0 {
+                let end = (512 * 1024).min(body.len()) - 1;
+                write!(
+                    connection,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                    end + 1,
+                    end,
+                    body_len,
+                )
+                .unwrap();
+                connection.write_all(&body[..=end]).unwrap();
+                continue;
+            }
+
+            server_failure_requested.store(true, Ordering::Release);
+            if !failure_released {
+                while !server_release_failure.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                failure_released = true;
+            }
+            write!(
+                connection,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            server_failure_sent.store(true, Ordering::Release);
+        }
+    });
+
+    let mut engine = NativeEngine::new().unwrap();
+    let source = StreamSource::new(format!("http://{address}/audio?clen={}", body_len));
+    engine.load(&source).unwrap();
+    engine.set_volume(0.0).unwrap();
+    engine.play().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !failure_requested.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "decoder never requested a later range"
+        );
+        std::thread::yield_now();
+    }
+    release_failure.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !failure_sent.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "fixture never sent the transient failure"
+        );
+        std::thread::yield_now();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while engine.last_error().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "decoder did not report the range failure"
+        );
+        std::thread::yield_now();
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(engine.state(), NativeState::Playing);
+    assert!(!engine.failed(), "buffered PCM must remain playable");
+    let error = engine.last_error().unwrap();
+    assert!(error.contains("HTTP status 503"));
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !engine.failed() {
+        assert!(
+            Instant::now() < deadline,
+            "failed playback did not become terminal after the buffer drained"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(engine.state(), NativeState::Error);
+    engine.stop().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn native_engine_retries_a_transient_later_range_before_playback() {
+    let body = silent_wav(5_000);
+    let body_len = body.len();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let failure_requested = Arc::new(AtomicBool::new(false));
+    let release_failure = Arc::new(AtomicBool::new(false));
+    let failure_sent = Arc::new(AtomicBool::new(false));
+    let retry_requested = Arc::new(AtomicBool::new(false));
+    let release_retry = Arc::new(AtomicBool::new(false));
+    let server_failure_requested = Arc::clone(&failure_requested);
+    let server_release_failure = Arc::clone(&release_failure);
+    let server_failure_sent = Arc::clone(&failure_sent);
+    let server_retry_requested = Arc::clone(&retry_requested);
+    let server_release_retry = Arc::clone(&release_retry);
+    let server = std::thread::spawn(move || {
+        let mut transient_sent = false;
+        for _ in 0..8 {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read = connection.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let range = request
+                .split("range=")
+                .nth(1)
+                .and_then(|value| value.split(['&', ' ', '\r', '\n']).next())
+                .and_then(|value| value.split('-').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if range == 0 {
+                let end = (512 * 1024).min(body_len) - 1;
+                write!(
+                    connection,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                    end + 1,
+                    end,
+                    body_len,
+                )
+                .unwrap();
+                connection.write_all(&body[..=end]).unwrap();
+                continue;
+            }
+            if !transient_sent {
+                transient_sent = true;
+                server_failure_requested.store(true, Ordering::Release);
+                while !server_release_failure.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                write!(
+                    connection,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                server_failure_sent.store(true, Ordering::Release);
+                continue;
+            }
+
+            server_retry_requested.store(true, Ordering::Release);
+            while !server_release_retry.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let end = (range + 512 * 1024).min(body_len) - 1;
+            write!(
+                connection,
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                end + 1 - range,
+                range,
+                end,
+                body_len,
+            )
+            .unwrap();
+            connection.write_all(&body[range..=end]).unwrap();
+            return;
+        }
+    });
+
+    let mut engine = NativeEngine::new().unwrap();
+    let source = StreamSource::new(format!("http://{address}/audio?clen={body_len}"));
+    engine.load(&source).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !failure_requested.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "decoder never requested the failed range"
+        );
+        std::thread::yield_now();
+    }
+    release_failure.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !failure_sent.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "fixture never sent the transient failure"
+        );
+        std::thread::yield_now();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !retry_requested.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "decoder did not retry the failed range"
+        );
+        std::thread::yield_now();
+    }
+
+    engine.set_volume(0.0).unwrap();
+    engine.play().unwrap();
+    release_retry.store(true, Ordering::Release);
+    engine.stop().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn native_engine_retries_a_transient_response_even_when_its_body_exceeds_the_range_cap() {
+    let body = silent_wav(1_000);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_attempts = Arc::clone(&attempts);
+    let server = std::thread::spawn(move || {
+        for attempt in 0..4 {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = connection.read(&mut request).unwrap();
+            server_attempts.fetch_add(1, Ordering::Release);
+            if attempt < 3 {
+                let oversized = vec![b'x'; 600 * 1024];
+                write!(
+                    connection,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    oversized.len()
+                )
+                .unwrap();
+                let _ = connection.write_all(&oversized);
+                continue;
+            }
+            let end = body.len() - 1;
+            write!(
+                connection,
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                body.len(),
+                end,
+                body.len()
+            )
+            .unwrap();
+            connection.write_all(&body).unwrap();
+        }
+    });
+
+    let mut engine = NativeEngine::new().unwrap();
+    engine
+        .load(&StreamSource::new(format!("http://{address}/audio")))
+        .unwrap();
+
+    assert_eq!(attempts.load(Ordering::Acquire), 4);
+    engine.stop().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn native_engine_rejects_a_mismatched_content_range_offset() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -144,6 +476,31 @@ fn native_engine_rejects_a_mismatched_content_range_offset() {
     let result = engine.load(&StreamSource::new(format!("http://{address}/audio")));
 
     assert!(result.is_err(), "incorrect Content-Range offset must fail");
+    server.join().unwrap();
+}
+
+#[test]
+fn native_engine_rejects_an_invalid_http_content_range_end() {
+    let body = silent_wav(1_000);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = connection.read(&mut request).unwrap();
+        write!(
+            connection,
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-9223372036854775807/9223372036854775807\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        connection.write_all(&body).unwrap();
+    });
+
+    let mut engine = NativeEngine::new().unwrap();
+    let result = engine.load(&StreamSource::new(format!("http://{address}/audio")));
+
+    assert!(result.is_err(), "invalid Content-Range must be rejected");
     server.join().unwrap();
 }
 
@@ -274,6 +631,127 @@ fn native_engine_cancels_a_stalled_http_prebuffer_before_replacing_it() {
         "stalled HTTP worker was not cancelled promptly: {:?}",
         started.elapsed()
     );
+    server.join().unwrap();
+}
+
+#[test]
+fn native_engine_internal_stop_aborts_a_trickling_http_prebuffer() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = connection.read(&mut request).unwrap();
+        connection
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: 10000000\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .unwrap();
+        let header = silent_wav(60_000);
+        connection.write_all(&header[..44]).unwrap();
+        for _ in 0..200 {
+            if connection.write_all(&[0]).is_err() {
+                break;
+            }
+            connection.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let mut engine = NativeEngine::new().unwrap();
+    let started = Instant::now();
+    let result = engine.load(&StreamSource::new(format!("http://{address}/audio.wav")));
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(14),
+        "internal decode stop did not abort trickling HTTP input promptly: {:?}",
+        started.elapsed()
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn native_engine_accepts_query_range_200_responses_across_multiple_chunks() {
+    let body = silent_wav(10_000);
+    let body_len = body.len();
+    assert!(body_len > 2 * 512 * 1024);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let later_range_requested = Arc::new(AtomicBool::new(false));
+    let server_later_range_requested = Arc::clone(&later_range_requested);
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut served = 0;
+        let mut saw_later_range = false;
+        while served < 8 && Instant::now() < deadline {
+            let Ok((mut connection, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            served += 1;
+            let mut request = [0_u8; 8192];
+            let Ok(read) = connection.read(&mut request) else {
+                continue;
+            };
+            let request = String::from_utf8_lossy(&request[..read]);
+            let start = request
+                .split("range=")
+                .nth(1)
+                .and_then(|value| value.split(['&', ' ', '\r', '\n']).next())
+                .and_then(|value| value.split('-').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if start > 0 {
+                server_later_range_requested.store(true, Ordering::Release);
+                saw_later_range = true;
+            }
+            let end = (start + 512 * 1024).min(body_len);
+            if end <= start {
+                continue;
+            }
+            write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                end - start
+            )
+            .unwrap();
+            let _ = connection.write_all(&body[start..end]);
+            if saw_later_range {
+                break;
+            }
+        }
+    });
+
+    let load_succeeded = Arc::new(AtomicBool::new(false));
+    let load_done = Arc::new(AtomicBool::new(false));
+    let loader_succeeded = Arc::clone(&load_succeeded);
+    let loader_done = Arc::clone(&load_done);
+    let mut engine = NativeEngine::new().unwrap();
+    let cancellation = engine.cancellation_handle().unwrap();
+    let loader = std::thread::spawn(move || {
+        let source = StreamSource::new(format!("http://{address}/audio?clen={body_len}"));
+        if engine.load(&source).is_ok() && engine.set_volume(0.0).is_ok() && engine.play().is_ok() {
+            loader_succeeded.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        loader_done.store(true, Ordering::Release);
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !load_done.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    cancellation.cancel();
+    loader.join().unwrap();
+    assert!(
+        load_done.load(Ordering::Acquire),
+        "query-range load did not settle"
+    );
+    assert!(
+        load_succeeded.load(Ordering::Acquire),
+        "query-range load failed"
+    );
+    assert!(later_range_requested.load(Ordering::Acquire));
     server.join().unwrap();
 }
 

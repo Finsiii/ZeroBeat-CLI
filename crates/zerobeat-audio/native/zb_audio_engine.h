@@ -58,6 +58,7 @@ int64_t zb_engine_get_ring_buffer_capacity_ms(zb_engine *engine);
 int64_t zb_engine_get_ffmpeg_probe_size_bytes(zb_engine *engine);
 int64_t zb_engine_get_ffmpeg_max_analyze_duration_us(zb_engine *engine);
 int64_t zb_engine_get_underrun_count(zb_engine *engine);
+int32_t zb_engine_has_failed(zb_engine *engine);
 int32_t zb_engine_get_spectrum(zb_engine *engine, uint8_t *bands,
                                int32_t band_count);
 int32_t zb_engine_analyze_spectrum(const float *samples, int64_t sample_count,

@@ -76,6 +76,58 @@ fn slash_focuses_search_and_query_survives_navigation() {
 }
 
 #[test]
+fn focused_search_shows_escape_unfocus_hint() {
+    let mut app = App::default();
+    app.handle_key(key(KeyCode::Char('/')));
+
+    let screen = render_screen(100, 30, &app);
+
+    assert!(screen.contains("Esc unfocus"));
+}
+
+#[test]
+fn focused_search_results_show_escape_unfocus_hint() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.navigation.open(Route::Search);
+    snapshot.search = SearchSnapshot {
+        status: SearchStatus::Ready,
+        results: vec![Track::new("one", "Tampar", "Juicy Luicy", 245_000)],
+        selected_index: 0,
+        request_id: 1,
+    };
+    let mut app = App::new(snapshot);
+    app.handle_key(key(KeyCode::Char('/')));
+
+    let screen = render_screen(100, 30, &app);
+
+    assert!(screen.contains("Esc unfocus"));
+}
+
+#[test]
+fn focused_search_always_shows_escape_unfocus_hint() {
+    for status in [
+        SearchStatus::Loading,
+        SearchStatus::Failed("network unavailable".to_owned()),
+        SearchStatus::Ready,
+    ] {
+        let mut snapshot = AppSnapshot::default();
+        snapshot.navigation.open(Route::Search);
+        snapshot.search = SearchSnapshot {
+            status,
+            results: Vec::new(),
+            selected_index: 0,
+            request_id: 1,
+        };
+        let mut app = App::new(snapshot);
+        app.handle_key(key(KeyCode::Char('/')));
+
+        let screen = render_screen(100, 30, &app);
+
+        assert!(screen.contains("Esc unfocus"));
+    }
+}
+
+#[test]
 fn navigation_and_search_keys_produce_daemon_commands() {
     let mut app = App::default();
 
@@ -359,21 +411,27 @@ fn spectrum_deck_uses_multiple_visual_rows() {
 }
 
 #[test]
-fn spectrum_visualizer_is_dense_between_native_peaks() {
+fn spectrum_visualizer_keeps_fixed_bar_slots() {
     let mut snapshot = AppSnapshot::default();
     snapshot.playback.status = PlaybackStatus::Playing;
     snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000));
     snapshot.playback.spectrum = [100; 24];
 
     let screen = render_screen(140, 38, &App::new(snapshot));
-    let active = |character: char| matches!(character, '▂' | '▄' | '▅' | '▆' | '▇' | '█');
-    let dense_row = screen.lines().any(|line| {
-        let characters = line.chars().collect::<Vec<_>>();
-        characters
-            .windows(2)
-            .any(|pair| active(pair[0]) && active(pair[1]))
-    });
-    assert!(dense_row, "visualizer should not alternate blank columns");
+    let visual_rows = screen
+        .lines()
+        .filter(|line| line.contains('█'))
+        .collect::<Vec<_>>();
+    assert!(!visual_rows.is_empty(), "visualizer should render bars");
+    assert!(visual_rows.iter().all(|line| {
+        let columns = line
+            .chars()
+            .enumerate()
+            .filter(|(_, character)| *character == '█')
+            .map(|(column, _)| column)
+            .collect::<Vec<_>>();
+        columns.windows(2).all(|pair| pair[1] - pair[0] == 2)
+    }));
 }
 
 #[test]

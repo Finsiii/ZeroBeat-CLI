@@ -68,6 +68,14 @@ pub trait AudioBackend: Send {
         BackendTelemetry::default()
     }
 
+    fn failed(&self) -> bool {
+        false
+    }
+
+    fn last_error(&self) -> Option<String> {
+        None
+    }
+
     #[cfg(target_os = "linux")]
     fn cancellation_handle(&self) -> Option<NativeCancellationHandle> {
         None

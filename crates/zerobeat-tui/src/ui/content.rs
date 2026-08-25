@@ -385,22 +385,41 @@ fn render_search(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
             ));
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                "Press / to focus · Enter to search",
+                if app.search_focused() {
+                    "Esc unfocus · Enter to search"
+                } else {
+                    "Press / to focus · Enter to search"
+                },
                 Style::default().fg(theme::TEXT_MUTED),
             ));
         }
-        SearchStatus::Loading => lines.push(Line::styled(
-            "Searching ZeroBeat…",
-            Style::default().fg(theme::ACCENT),
-        )),
-        SearchStatus::Failed(message) => lines.push(Line::styled(
-            format!("Search failed: {message}"),
-            Style::default().fg(ratatui::style::Color::LightRed),
-        )),
-        SearchStatus::Ready if app.search().results.is_empty() => lines.push(Line::styled(
-            "No results found. Try a different title or artist.",
-            Style::default().fg(theme::TEXT_MUTED),
-        )),
+        SearchStatus::Loading => {
+            lines.push(Line::styled(
+                "Searching ZeroBeat…",
+                Style::default().fg(theme::ACCENT),
+            ));
+            if app.search_focused() {
+                focused_search_hint(&mut lines);
+            }
+        }
+        SearchStatus::Failed(message) => {
+            lines.push(Line::styled(
+                format!("Search failed: {message}"),
+                Style::default().fg(ratatui::style::Color::LightRed),
+            ));
+            if app.search_focused() {
+                focused_search_hint(&mut lines);
+            }
+        }
+        SearchStatus::Ready if app.search().results.is_empty() => {
+            lines.push(Line::styled(
+                "No results found. Try a different title or artist.",
+                Style::default().fg(theme::TEXT_MUTED),
+            ));
+            if app.search_focused() {
+                focused_search_hint(&mut lines);
+            }
+        }
         SearchStatus::Ready => {
             for (index, track) in app.search().results.iter().enumerate() {
                 hits.add(
@@ -434,7 +453,11 @@ fn render_search(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
             }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                "↑/↓ select · Enter play · a add to queue",
+                if app.search_focused() {
+                    "Esc unfocus · ↑/↓ select · Enter play · a add to queue"
+                } else {
+                    "↑/↓ select · Enter play · a add to queue"
+                },
                 Style::default().fg(theme::TEXT_MUTED),
             ));
         }
@@ -444,6 +467,14 @@ fn render_search(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
             .block(card().title(format!(" {} results ", app.search().results.len()))),
         rows[1],
     );
+}
+
+fn focused_search_hint(lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Esc unfocus",
+        Style::default().fg(theme::TEXT_MUTED),
+    ));
 }
 
 fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
