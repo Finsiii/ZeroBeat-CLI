@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential pkg-config shellcheck \
+            libsqlite3-dev libcurl4-openssl-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup component add --toolchain 1.96.0 rustfmt clippy
+          rustup default 1.96.0
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Validate release shell
+        run: |
+          sh -n install.sh
+          bash -n scripts/benchmark.sh
+          shellcheck install.sh scripts/benchmark.sh
+
+      - name: Check native shared-library resolution
+        run: |
+          missing="$(ldd target/release/zerobeat | grep 'not found' || true)"
+          missing="$missing$(ldd target/release/zerobeatd | grep 'not found' || true)"
+          test -z "$missing"

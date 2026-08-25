@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential pkg-config \
+            libsqlite3-dev libcurl4-openssl-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup component add --toolchain 1.96.0 rustfmt clippy
+          rustup default 1.96.0
+
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "release must be tagged vX.Y.Z" >&2; exit 1 ;;
+          esac
+          expected="${RELEASE_TAG#v}"
+          versions="$(grep -hE '^version = "[^"]+"' crates/*/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/' | sort -u)"
+          test "$(printf '%s\n' "$versions" | wc -l)" -eq 1
+          test "$versions" = "$expected"
+
+      - name: Verify source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --all-targets --locked
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Check native shared-library resolution
+        run: |
+          missing="$(ldd target/release/zerobeat | grep 'not found' || true)"
+          missing="$missing$(ldd target/release/zerobeatd | grep 'not found' || true)"
+          test -z "$missing"
+
+      - name: Package stable Linux x86_64 archive
+        id: package
+        run: |
+          set -eu
+          rm -rf dist
+          mkdir -p dist/stage
+          install -m 755 target/release/zerobeat dist/stage/zerobeat
+          install -m 755 target/release/zerobeatd dist/stage/zerobeatd
+          install -m 644 README.md dist/stage/README.md
+          install -m 644 LICENSE dist/stage/LICENSE
+          tar -C dist/stage -czf dist/zerobeat-linux-x86_64.tar.gz \
+            zerobeat zerobeatd README.md LICENSE
+          sha256sum dist/zerobeat-linux-x86_64.tar.gz \
+            > dist/zerobeat-linux-x86_64.tar.gz.sha256
+          echo "archive=dist/zerobeat-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/zerobeat-linux-x86_64.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "dist/zerobeat-linux-x86_64.tar.gz" \
+            "dist/zerobeat-linux-x86_64.tar.gz.sha256" \
+            --title "ZeroBeat $RELEASE_TAG" \
+            --generate-notes
