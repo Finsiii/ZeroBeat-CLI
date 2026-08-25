@@ -302,11 +302,15 @@ fn native_engine_retries_a_transient_later_range_before_playback() {
     let failure_sent = Arc::new(AtomicBool::new(false));
     let retry_requested = Arc::new(AtomicBool::new(false));
     let release_retry = Arc::new(AtomicBool::new(false));
+    let retry_response_done = Arc::new(AtomicBool::new(false));
+    let retry_response_ok = Arc::new(AtomicBool::new(false));
     let server_failure_requested = Arc::clone(&failure_requested);
     let server_release_failure = Arc::clone(&release_failure);
     let server_failure_sent = Arc::clone(&failure_sent);
     let server_retry_requested = Arc::clone(&retry_requested);
     let server_release_retry = Arc::clone(&release_retry);
+    let server_retry_response_done = Arc::clone(&retry_response_done);
+    let server_retry_response_ok = Arc::clone(&retry_response_ok);
     let server = std::thread::spawn(move || {
         let mut transient_sent = false;
         for _ in 0..8 {
@@ -354,7 +358,7 @@ fn native_engine_retries_a_transient_later_range_before_playback() {
                 std::thread::yield_now();
             }
             let end = (range + 512 * 1024).min(body_len) - 1;
-            write!(
+            let response_ok = write!(
                 connection,
                 "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
                 end + 1 - range,
@@ -362,8 +366,10 @@ fn native_engine_retries_a_transient_later_range_before_playback() {
                 end,
                 body_len,
             )
-            .unwrap();
-            connection.write_all(&body[range..=end]).unwrap();
+            .and_then(|()| connection.write_all(&body[range..=end]))
+            .is_ok();
+            server_retry_response_ok.store(response_ok, Ordering::Release);
+            server_retry_response_done.store(true, Ordering::Release);
             return;
         }
     });
@@ -401,6 +407,18 @@ fn native_engine_retries_a_transient_later_range_before_playback() {
     engine.set_volume(0.0).unwrap();
     engine.play().unwrap();
     release_retry.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !retry_response_done.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not complete the retry response"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        retry_response_ok.load(Ordering::Acquire),
+        "fixture could not send the retry response"
+    );
     engine.stop().unwrap();
     server.join().unwrap();
 }
