@@ -288,8 +288,12 @@ fn studio_deck_renders_real_spectrum_and_library_first_sidebar_without_capsules(
     ] {
         assert!(screen.contains(expected), "missing {expected:?}");
     }
-    assert!(screen.chars().any(is_braille_bar));
-    assert!(!screen.contains("▁ ▁"));
+    assert!(screen.chars().any(is_soft_block));
+    assert!(
+        !screen
+            .chars()
+            .any(|character| matches!(character as u32, 0x2800..=0x28ff))
+    );
     assert!(!screen.contains("ONLINE"));
     assert!(!screen.contains("[Online]"));
     for target in [
@@ -402,7 +406,7 @@ fn spectrum_deck_uses_multiple_visual_rows() {
     let screen = render_screen(140, 38, &App::new(snapshot));
     let visual_rows = screen
         .lines()
-        .filter(|line| line.chars().any(is_braille_bar))
+        .filter(|line| line.chars().any(is_soft_block))
         .count();
     assert!(
         visual_rows >= 3,
@@ -420,14 +424,14 @@ fn spectrum_visualizer_keeps_fixed_bar_slots() {
     let screen = render_screen(140, 38, &App::new(snapshot));
     let visual_rows = screen
         .lines()
-        .filter(|line| line.chars().any(is_braille_bar))
+        .filter(|line| line.chars().any(is_soft_block))
         .collect::<Vec<_>>();
     assert!(!visual_rows.is_empty(), "visualizer should render bars");
     assert!(visual_rows.iter().all(|line| {
         let columns = line
             .chars()
             .enumerate()
-            .filter(|(_, character)| is_braille_bar(*character))
+            .filter(|(_, character)| is_soft_block(*character))
             .map(|(column, _)| column)
             .collect::<Vec<_>>();
         columns.windows(2).all(|pair| pair[1] - pair[0] == 2)
@@ -435,7 +439,7 @@ fn spectrum_visualizer_keeps_fixed_bar_slots() {
 }
 
 #[test]
-fn paused_visualizer_is_a_continuous_line_instead_of_dotted_blocks() {
+fn paused_visualizer_is_blank_while_progress_remains_visible() {
     let mut snapshot = AppSnapshot::default();
     snapshot.playback.status = PlaybackStatus::Paused;
     snapshot.playback.current = Some(Track::new("one", "Tampar", "Juicy Luicy", 203_000));
@@ -443,7 +447,7 @@ fn paused_visualizer_is_a_continuous_line_instead_of_dotted_blocks() {
     let screen = render_screen(140, 28, &App::new(snapshot));
 
     assert!(screen.contains("────────"));
-    assert!(!screen.contains("▁ ▁"));
+    assert!(!screen.chars().any(is_soft_block));
 }
 
 #[test]
@@ -724,8 +728,8 @@ fn render_screen(width: u16, height: u16, app: &App) -> String {
     render_screen_with_hits(width, height, app).0
 }
 
-fn is_braille_bar(character: char) -> bool {
-    matches!(character as u32, 0x2840 | 0x2844 | 0x2846 | 0x2847)
+fn is_soft_block(character: char) -> bool {
+    matches!(character, '▁'..='█')
 }
 
 fn render_screen_with_hits(width: u16, height: u16, app: &App) -> (String, zerobeat_tui::HitMap) {

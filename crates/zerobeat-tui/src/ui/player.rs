@@ -300,30 +300,27 @@ fn centered(frame: &mut Frame, area: Rect, line: Line<'_>) {
 }
 
 fn spectrum_rows(spectrum: &[u8; 24], available_width: u16) -> Vec<String> {
-    const WAVE_ROWS: usize = 4;
-    const DOT_ROWS: usize = 4;
+    const WAVE_ROWS: usize = 5;
+    const BLOCK_LEVELS: usize = 8;
     const BAR_COUNT: usize = 24;
     const SLOT_WIDTH: usize = 2;
     const WIDTH: usize = BAR_COUNT * SLOT_WIDTH - 1;
-    const MAX_LEVEL: usize = WAVE_ROWS * DOT_ROWS;
-    const LEFT_DOTS: [u32; DOT_ROWS + 1] = [0x00, 0x40, 0x44, 0x46, 0x47];
+    const MAX_LEVEL: usize = WAVE_ROWS * BLOCK_LEVELS;
+    const PARTIAL_BLOCKS: [char; BLOCK_LEVELS - 1] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'];
 
-    let mut rows = vec![vec![' '; WIDTH]; WAVE_ROWS + 1];
+    let mut rows = vec![vec![' '; WIDTH]; WAVE_ROWS];
     for (band, value) in spectrum.iter().enumerate() {
         let height = (usize::from((*value).min(100)) * MAX_LEVEL).div_ceil(100);
         let column = band * SLOT_WIDTH;
-        for (row, output) in rows.iter_mut().take(WAVE_ROWS).enumerate() {
-            let levels = height
-                .saturating_sub((WAVE_ROWS - 1 - row) * DOT_ROWS)
-                .min(DOT_ROWS);
-            if levels == 0 {
-                continue;
-            }
-            output[column] =
-                char::from_u32(0x2800 + LEFT_DOTS[levels]).expect("valid Braille glyph");
+        let full_blocks = height / BLOCK_LEVELS;
+        let partial = height % BLOCK_LEVELS;
+        for offset in 0..full_blocks.min(WAVE_ROWS) {
+            rows[WAVE_ROWS - 1 - offset][column] = '█';
+        }
+        if partial > 0 && full_blocks < WAVE_ROWS {
+            rows[WAVE_ROWS - 1 - full_blocks][column] = PARTIAL_BLOCKS[partial - 1];
         }
     }
-    rows[WAVE_ROWS].fill('─');
     let output_width = usize::from(available_width).min(WIDTH);
     let crop_start = WIDTH.saturating_sub(output_width) / 2;
     let crop_end = crop_start + output_width;
@@ -357,12 +354,8 @@ mod tests {
 
         let low_rows = spectrum_rows(&low, 80);
         let high_rows = spectrum_rows(&high, 80);
-        assert_eq!(glyph_at(&low_rows[3], 4), '\u{2844}');
-        assert!(
-            high_rows[..4]
-                .iter()
-                .all(|row| glyph_at(row, 4) == '\u{2847}')
-        );
+        assert_eq!(glyph_at(&low_rows[4], 4), '▅');
+        assert!(high_rows.iter().all(|row| glyph_at(row, 4) == '█'));
     }
 
     #[test]
@@ -408,12 +401,11 @@ mod tests {
     }
 
     #[test]
-    fn zero_spectrum_is_a_stable_horizontal_baseline() {
+    fn silent_spectrum_is_blank_without_a_decorative_baseline() {
         let rows = spectrum_rows(&[0; 24], 80);
 
         assert_eq!(rows.len(), 5);
-        assert!(rows[..4].iter().all(|row| row.chars().all(|c| c == ' ')));
-        assert!(rows[4].chars().all(|c| c == '─'));
+        assert!(rows.iter().all(|row| row.chars().all(|c| c == ' ')));
     }
 
     fn active_columns(rows: &[String]) -> Vec<usize> {
