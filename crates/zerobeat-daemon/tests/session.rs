@@ -311,7 +311,16 @@ async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
         previous.playback.current.as_ref().unwrap().title,
         "Direct Pick"
     );
-    let queue_len = previous.playback.queue.len();
+    let settled = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && snapshot
+                .playback
+                .current
+                .as_ref()
+                .is_some_and(|track| track.id == "direct")
+    })
+    .await;
+    let queue_len = settled.playback.queue.len();
 
     let removed = exchange(&mut client, ClientCommand::RemoveQueueIndex(0)).await;
     let DaemonEvent::Snapshot(removed) = removed else {
