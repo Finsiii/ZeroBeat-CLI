@@ -28,8 +28,8 @@ uses sudo and never removes user data.
 
 Examples:
   ./install.sh
-  VERSION=v0.1.3 ./install.sh
-  PREFIX=/usr/local VERSION=v0.1.3 ./install.sh
+  VERSION=v0.1.4 ./install.sh
+  PREFIX=/usr/local VERSION=v0.1.4 ./install.sh
   ./install.sh --uninstall
 EOF
 }
@@ -223,7 +223,7 @@ case "$VERSION" in
     v[0-9]*)
         BASE_URL=${ZEROBEAT_RELEASE_BASE_URL:-"https://github.com/$REPOSITORY/releases/download/$VERSION"}
         ;;
-    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.3)' ;;
+    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.4)' ;;
 esac
 
 case "$BASE_URL" in
@@ -250,7 +250,19 @@ DISTRO_ID=$(read_os_release_value ID) || die 'could not identify Linux distribut
 DISTRO_VERSION=$(read_os_release_value VERSION_ID || true)
 case "$DISTRO_ID" in
     arch)
-        ARCHIVE_NAME=zerobeat-linux-arch-x86_64.tar.gz
+        if ldconfig -p | grep -F 'libavformat.so.62 ' >/dev/null 2>&1 &&
+            ldconfig -p | grep -F 'libavcodec.so.62 ' >/dev/null 2>&1 &&
+            ldconfig -p | grep -F 'libavutil.so.60 ' >/dev/null 2>&1 &&
+            ldconfig -p | grep -F 'libswresample.so.6 ' >/dev/null 2>&1; then
+            ARCHIVE_NAME=zerobeat-linux-arch-ffmpeg8-x86_64.tar.gz
+        elif ldconfig -p | grep -F 'libavformat.so.63 ' >/dev/null 2>&1 &&
+            ldconfig -p | grep -F 'libavcodec.so.63 ' >/dev/null 2>&1 &&
+            ldconfig -p | grep -F 'libavutil.so.61 ' >/dev/null 2>&1 &&
+            ldconfig -p | grep -F 'libswresample.so.7 ' >/dev/null 2>&1; then
+            ARCHIVE_NAME=zerobeat-linux-arch-ffmpeg9-x86_64.tar.gz
+        else
+            die 'unsupported Arch Linux FFmpeg ABI; ZeroBeat prebuilt releases support FFmpeg 8 and 9'
+        fi
         ;;
     ubuntu)
         [ "$DISTRO_VERSION" = 24.04 ] ||

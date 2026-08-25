@@ -25,8 +25,8 @@ targets.
 
 The installer is user-scoped, verifies the release archive and SHA-256
 checksum, and never invokes `sudo`. Download it to a temporary file and run
-that file; do not pipe a network response into a shell. No optional pager is
-required:
+that file; do not pipe a network response into a shell. No pager or inspection
+utility is required:
 
 ```bash
 # Bash or Zsh
@@ -48,13 +48,11 @@ and sh "$installer"
 and rm -f "$installer"
 ```
 
-The installer needs `curl`, `sha256sum`, `tar`, `mktemp`, `install`, and the
-standard POSIX tools. It also uses `readelf` from `binutils` and `ldconfig`
-from the system glibc package to validate the two ELF binaries. On a minimal
-system, install those packages before running it. On Ubuntu 24.04 it
-automatically selects the `zerobeat-linux-x86_64.tar.gz` artifact; on Arch
-Linux it selects `zerobeat-linux-arch-x86_64.tar.gz`. Other
-distro/version targets are rejected. The installer requires a writable
+The command uses only `curl`, the shell, and standard system utilities; it
+does not require `less` or another optional viewer. On Ubuntu 24.04 the
+installer selects `zerobeat-linux-x86_64.tar.gz`. On Arch Linux it detects
+the installed FFmpeg ABI and selects the matching FFmpeg 8 or FFmpeg 9 build.
+Other distro/version targets are rejected. The installer requires a writable
 absolute `PREFIX`; by default it uses `$HOME/.local`.
 
 Add the default bin directory to the current shell and start the player:
@@ -83,18 +81,20 @@ refuses to remove files that are missing, modified, unowned, or symlinks.
 
 ## Manual release installation
 
-Download the platform-specific archive and checksum for v0.1.3, then verify
+Download the platform-specific archive and checksum for v0.1.4, then verify
 before extracting. Choose exactly one archive name:
 
 ```bash
-version=v0.1.3
+version=v0.1.4
 base="https://github.com/Finsiii/ZeroBeat-CLI/releases/download/$version"
 mkdir -p "$HOME/tmp/zerobeat-$version"
 cd "$HOME/tmp/zerobeat-$version"
 # Ubuntu 24.04:
 archive=zerobeat-linux-x86_64.tar.gz
-# Arch Linux:
-# archive=zerobeat-linux-arch-x86_64.tar.gz
+# Arch Linux with FFmpeg 8:
+# archive=zerobeat-linux-arch-ffmpeg8-x86_64.tar.gz
+# Arch Linux with FFmpeg 9:
+# archive=zerobeat-linux-arch-ffmpeg9-x86_64.tar.gz
 checksum="$archive.sha256"
 curl --proto '=https' --tlsv1.2 -fLO "$base/$archive"
 curl --proto '=https' --tlsv1.2 -fLO "$base/$checksum"

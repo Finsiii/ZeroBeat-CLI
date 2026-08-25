@@ -87,12 +87,22 @@ jobs:
           arch_dist="$RUNNER_TEMP/zerobeat-arch-dist"
           rm -rf "$arch_dist"
           mkdir -p "$arch_dist"
-          docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/src:ro" \
-            --volume "$arch_dist:/out" \
-            archlinux:base-devel \
-            bash -euxo pipefail -c '
-              pacman -Syu --noconfirm --needed \
+          build_arch() {
+            snapshot=$1
+            archive=$2
+            docker run --rm \
+              --env ARCH_SNAPSHOT="$snapshot" \
+              --env ARCHIVE_NAME="$archive" \
+              --volume "$GITHUB_WORKSPACE:/src:ro" \
+              --volume "$arch_dist:/out" \
+              archlinux:base-devel \
+              bash -euxo pipefail -c '
+              if [ -n "$ARCH_SNAPSHOT" ]; then
+                printf "Server = https://archive.archlinux.org/repos/%s/\$repo/os/\$arch\n" \
+                  "$ARCH_SNAPSHOT" > /etc/pacman.d/mirrorlist
+              fi
+              pacman -Syyuu --noconfirm
+              pacman -S --noconfirm --needed \
                 rustup pkgconf curl sqlite ffmpeg alsa-lib libpulse pipewire
               rustup toolchain install 1.96.0 --profile minimal --no-self-update
               rustup default 1.96.0
@@ -110,23 +120,33 @@ jobs:
               install -m 755 "$CARGO_TARGET_DIR/release/zerobeatd" "$stage/zerobeatd"
               install -m 644 /src/README.md "$stage/README.md"
               install -m 644 /src/LICENSE "$stage/LICENSE"
-              tar -C "$stage" -czf /out/zerobeat-linux-arch-x86_64.tar.gz \
+              tar -C "$stage" -czf "/out/$ARCHIVE_NAME" \
                 zerobeat-cli zerobeatd README.md LICENSE
-              (cd /out && sha256sum zerobeat-linux-arch-x86_64.tar.gz) \
-                > /out/zerobeat-linux-arch-x86_64.tar.gz.sha256
+              (cd /out && sha256sum "$ARCHIVE_NAME") \
+                > "/out/$ARCHIVE_NAME.sha256"
             '
-          echo "archive=$arch_dist/zerobeat-linux-arch-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=$arch_dist/zerobeat-linux-arch-x86_64.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          }
+          build_arch 2026/05/23 zerobeat-linux-arch-ffmpeg8-x86_64.tar.gz
+          build_arch 2026/08/24 zerobeat-linux-arch-ffmpeg9-x86_64.tar.gz
+          echo "ffmpeg8_archive=$arch_dist/zerobeat-linux-arch-ffmpeg8-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg8_checksum=$arch_dist/zerobeat-linux-arch-ffmpeg8-x86_64.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg9_archive=$arch_dist/zerobeat-linux-arch-ffmpeg9-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg9_checksum=$arch_dist/zerobeat-linux-arch-ffmpeg9-x86_64.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Attest Ubuntu release archive
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: ${{ steps.package.outputs.archive }}
 
-      - name: Attest Arch Linux release archive
+      - name: Attest Arch Linux FFmpeg 8 release archive
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: ${{ steps.arch-package.outputs.archive }}
+          subject-path: ${{ steps.arch-package.outputs.ffmpeg8_archive }}
+
+      - name: Attest Arch Linux FFmpeg 9 release archive
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ steps.arch-package.outputs.ffmpeg9_archive }}
 
       - name: Publish GitHub release
         env:
@@ -136,7 +156,9 @@ jobs:
           gh release create "$RELEASE_TAG" \
             "dist/zerobeat-linux-x86_64.tar.gz" \
             "dist/zerobeat-linux-x86_64.tar.gz.sha256" \
-            "${{ steps.arch-package.outputs.archive }}" \
-            "${{ steps.arch-package.outputs.checksum }}" \
+            "${{ steps.arch-package.outputs.ffmpeg8_archive }}" \
+            "${{ steps.arch-package.outputs.ffmpeg8_checksum }}" \
+            "${{ steps.arch-package.outputs.ffmpeg9_archive }}" \
+            "${{ steps.arch-package.outputs.ffmpeg9_checksum }}" \
             --title "ZeroBeat $RELEASE_TAG" \
             --generate-notes
