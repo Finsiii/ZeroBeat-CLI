@@ -9,6 +9,8 @@ use zerobeat_protocol::{PlaybackStatus, RepeatMode};
 
 use crate::{App, HitMap, MouseTarget, theme};
 
+const LOADING_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+
 pub fn render_player(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
     hits.add(MouseTarget::Player, area);
     frame.render_widget(
@@ -33,6 +35,16 @@ pub fn render_player(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap
         Constraint::Length(1),
     ])
     .split(inner);
+
+    if app.playback().current.is_none()
+        && matches!(
+            app.playback().status,
+            PlaybackStatus::Resolving | PlaybackStatus::Buffering
+        )
+    {
+        render_loading(frame, rows.as_ref(), app);
+        return;
+    }
 
     let Some(track) = app.playback().current.as_ref() else {
         render_empty(frame, rows.as_ref());
@@ -96,6 +108,50 @@ pub fn render_player(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap
         rows[5],
         Line::styled(
             "/ search  ·  ↑/↓ browse  ·  Enter select  ·  ←/→ seek 10s  ·  q quit",
+            Style::default().fg(theme::TEXT_MUTED),
+        ),
+    );
+}
+
+fn render_loading(frame: &mut Frame, rows: &[Rect], app: &App) {
+    let status = match app.playback().status {
+        PlaybackStatus::Resolving => "RESOLVING",
+        PlaybackStatus::Buffering => "BUFFERING",
+        _ => return,
+    };
+    let spinner = LOADING_FRAMES[usize::from(app.animation_frame()) % LOADING_FRAMES.len()];
+    centered(
+        frame,
+        rows[0],
+        Line::from(vec![
+            Span::styled(
+                format!("{status} {spinner}"),
+                Style::default().fg(theme::ACCENT),
+            ),
+            Span::styled(
+                format!(
+                    "  ·  NATIVE OUTPUT 48 kHz  ·  {} queued",
+                    app.playback().queue.len()
+                ),
+                Style::default().fg(theme::TEXT_MUTED),
+            ),
+        ]),
+    );
+    centered(
+        frame,
+        rows[1],
+        Line::styled(
+            "Preparing audio stream",
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    );
+    centered(
+        frame,
+        rows[3],
+        Line::styled(
+            "Playback will start when the stream is ready",
             Style::default().fg(theme::TEXT_MUTED),
         ),
     );

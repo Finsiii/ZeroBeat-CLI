@@ -13,6 +13,8 @@ use zerobeat_protocol::{ClientCommand, PROTOCOL_VERSION};
 use zerobeat_runtime::socket_path;
 use zerobeat_tui::{App, HitMap, connect_or_spawn, render};
 
+const UI_TICK: Duration = Duration::from_millis(100);
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect_or_spawn(&socket_path(PROTOCOL_VERSION)).await?;
@@ -21,7 +23,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while !app.should_quit() {
         let hits = terminal.draw(&app)?;
-        if !event::poll(Duration::from_millis(100))? {
+        if !event::poll(UI_TICK)? {
+            app.advance_animation();
             if app.needs_refresh() {
                 let snapshot = client.execute(ClientCommand::RequestSnapshot).await?;
                 app.replace_snapshot(snapshot);

@@ -284,10 +284,12 @@ fn studio_deck_renders_real_spectrum_and_library_first_sidebar_without_capsules(
         "PLAYBACK",
         "Queue",
         "Lyrics",
-        "Native audio 48 kHz",
     ] {
         assert!(screen.contains(expected), "missing {expected:?}");
     }
+    assert!(!screen.contains("Guest session"));
+    assert!(!screen.contains("Native audio 48 kHz"));
+    assert!(!screen.contains("No underruns"));
     assert!(screen.chars().any(is_soft_block));
     assert!(
         !screen
@@ -695,6 +697,8 @@ fn settings_control_persistent_crossfade_duration() {
 
     let screen = render_screen(100, 30, &app);
     assert!(screen.contains("6 seconds"));
+    assert!(screen.contains("Press [ to decrease · Press ] to increase"));
+    assert!(!screen.contains("[ / ]"));
     assert!(screen.contains("Android app only"));
     assert_eq!(
         app.handle_key(key(KeyCode::Char(']'))),
@@ -704,6 +708,36 @@ fn settings_control_persistent_crossfade_duration() {
         app.handle_key(key(KeyCode::Char('['))),
         Some(ClientCommand::SetCrossfadeSeconds(5))
     );
+}
+
+#[test]
+fn resolving_without_a_current_track_renders_a_loading_deck() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Resolving;
+    let mut app = App::new(snapshot);
+
+    let first = render_screen(120, 34, &app);
+    assert!(first.contains("RESOLVING"));
+    assert!(status_line(&first, "RESOLVING").contains("RESOLVING |"));
+    assert!(!first.contains("Nothing playing"));
+
+    let first_status = status_line(&first, "RESOLVING");
+    app.advance_animation();
+    let second = render_screen(120, 34, &app);
+    let second_status = status_line(&second, "RESOLVING");
+    assert!(second_status.contains("RESOLVING /"));
+    assert_ne!(first_status, second_status);
+}
+
+#[test]
+fn buffering_without_a_current_track_renders_a_loading_deck() {
+    let mut snapshot = AppSnapshot::default();
+    snapshot.playback.status = PlaybackStatus::Buffering;
+    let app = App::new(snapshot);
+
+    let screen = render_screen(120, 34, &app);
+    assert!(screen.contains("BUFFERING"));
+    assert!(!screen.contains("Nothing playing"));
 }
 
 #[test]
@@ -726,6 +760,13 @@ fn queue_is_visible_on_wide_layout_and_toggleable_as_a_focus_view() {
 
 fn render_screen(width: u16, height: u16, app: &App) -> String {
     render_screen_with_hits(width, height, app).0
+}
+
+fn status_line<'a>(screen: &'a str, status: &str) -> &'a str {
+    screen
+        .lines()
+        .find(|line| line.contains(status))
+        .expect("loading status line")
 }
 
 fn is_soft_block(character: char) -> bool {

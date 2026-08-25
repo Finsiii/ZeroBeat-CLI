@@ -239,32 +239,6 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitMap) {
         )
         .style(Style::default().bg(theme::SURFACE));
     frame.render_widget(sidebar, area);
-    if area.height >= 6 {
-        let status = Rect::new(
-            area.x.saturating_add(3),
-            area.bottom().saturating_sub(4),
-            area.width.saturating_sub(5),
-            3,
-        );
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled("Guest session", Style::default().fg(theme::ACCENT)),
-                Line::styled(
-                    "Native audio 48 kHz",
-                    Style::default().fg(theme::TEXT_MUTED),
-                ),
-                Line::styled(
-                    if app.playback().underrun_count == 0 {
-                        "No underruns".to_owned()
-                    } else {
-                        format!("{} underruns", app.playback().underrun_count)
-                    },
-                    Style::default().fg(theme::TEXT_MUTED),
-                ),
-            ]),
-            status,
-        );
-    }
 }
 
 fn push_nav(

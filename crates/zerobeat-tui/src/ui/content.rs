@@ -485,7 +485,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Line::styled(
             format!(
-                "[ / ]  {} seconds{}",
+                "{} seconds{}",
                 app.settings().crossfade_seconds,
                 if app.settings().crossfade_seconds == 0 {
                     " · disabled"
@@ -497,6 +497,10 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Line::styled(
             "Equal-power dual-deck transition · range 0–12 seconds",
+            Style::default().fg(theme::TEXT_MUTED),
+        ),
+        Line::styled(
+            "Press [ to decrease · Press ] to increase",
             Style::default().fg(theme::TEXT_MUTED),
         ),
         Line::raw(""),

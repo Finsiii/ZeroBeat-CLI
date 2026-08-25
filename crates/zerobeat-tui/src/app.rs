@@ -8,6 +8,7 @@ use zerobeat_protocol::{
 };
 
 const TRANSPORT_COOLDOWN: Duration = Duration::from_secs(2);
+const LOADING_FRAME_COUNT: u8 = 4;
 
 #[derive(Default)]
 struct TransportCooldown {
@@ -47,6 +48,7 @@ pub struct App {
     spectrum_initialized: bool,
     spectrum_track_id: Option<String>,
     transport_cooldown: TransportCooldown,
+    animation_frame: u8,
 }
 
 impl App {
@@ -145,6 +147,14 @@ impl App {
                 )
             })
             || self.lyrics().status == zerobeat_protocol::LyricsStatus::Loading
+    }
+
+    pub fn advance_animation(&mut self) {
+        self.animation_frame = (self.animation_frame + 1) % LOADING_FRAME_COUNT;
+    }
+
+    pub fn animation_frame(&self) -> u8 {
+        self.animation_frame
     }
 
     pub fn should_quit(&self) -> bool {
@@ -569,6 +579,19 @@ mod tests {
         cooldown.restart_at(start + Duration::from_millis(750));
         assert!(cooldown.is_active_at(start + Duration::from_millis(2_749)));
         assert!(!cooldown.is_active_at(start + Duration::from_millis(2_750)));
+    }
+
+    #[test]
+    fn animation_frame_cycles_on_each_tick() {
+        let mut app = App::default();
+
+        assert_eq!(app.animation_frame(), 0);
+        app.advance_animation();
+        assert_eq!(app.animation_frame(), 1);
+        app.advance_animation();
+        app.advance_animation();
+        app.advance_animation();
+        assert_eq!(app.animation_frame(), 0);
     }
 
     fn key(character: char) -> KeyEvent {
