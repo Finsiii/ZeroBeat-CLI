@@ -421,10 +421,10 @@ async fn apply_command(
         }
         ClientCommand::PlaySelected => {
             let _queue_guard = playback.queue_mutation.lock().await;
-            let (selected_index, tracks, start) = {
+            let (selected, start) = {
                 let snapshot = state.lock().await;
                 let selected_index = snapshot.search.selected_index;
-                let Some(_) = snapshot.search.results.get(selected_index) else {
+                let Some(selected) = snapshot.search.results.get(selected_index).cloned() else {
                     return (snapshot_event(snapshot.clone()), false);
                 };
                 let start = if matches!(
@@ -435,14 +435,9 @@ async fn apply_command(
                 } else {
                     PlaybackStart::Replace
                 };
-                (selected_index, snapshot.search.results.clone(), start)
+                (selected, start)
             };
-            let queue_request = QueueStart {
-                tracks: tracks.clone(),
-                current_index: selected_index,
-                endless_queue: true,
-                ..QueueStart::default()
-            };
+            let queue_request = direct_radio_queue_start(&selected);
             let backend_session = match queue.start_queue(queue_request).await {
                 Ok(session) => session,
                 Err(error) => {
@@ -457,7 +452,7 @@ async fn apply_command(
                 .tracks
                 .get(backend_session.current_index)
                 .cloned()
-                .or_else(|| tracks.get(selected_index).cloned());
+                .or_else(|| Some(selected.clone()));
             let Some(track) = track else {
                 return (snapshot_event(snapshot.clone()), false);
             };
@@ -521,28 +516,18 @@ async fn apply_command(
         }
         ClientCommand::PlayTrack(track) => {
             let _queue_guard = playback.queue_mutation.lock().await;
-            let (start, queue_candidates) = {
+            let start = {
                 let snapshot = state.lock().await;
-                let start = if matches!(
+                if matches!(
                     snapshot.playback.status,
                     PlaybackStatus::Playing | PlaybackStatus::Paused
                 ) {
                     PlaybackStart::Crossfade(Duration::from_millis(500))
                 } else {
                     PlaybackStart::Replace
-                };
-                (start, snapshot.playback.queue.clone())
+                }
             };
-            let backend_session = match queue
-                .start_queue(QueueStart {
-                    tracks: queue_candidates.clone(),
-                    track: Some(track.clone()),
-                    current_index: 0,
-                    endless_queue: true,
-                    ..QueueStart::default()
-                })
-                .await
-            {
+            let backend_session = match queue.start_queue(direct_radio_queue_start(&track)).await {
                 Ok(session) => session,
                 Err(error) => {
                     let mut snapshot = state.lock().await;
@@ -1102,6 +1087,18 @@ fn clear_pending_transition(playback: &PlaybackCoordinator, request_id: u64) {
 
 fn transition_pending(playback: &PlaybackCoordinator) -> bool {
     playback.pending_transition.load(Ordering::Acquire) != 0
+}
+
+fn direct_radio_queue_start(track: &Track) -> QueueStart {
+    QueueStart {
+        tracks: Vec::new(),
+        current_index: 0,
+        track: Some(track.clone()),
+        playlist_id: Some(format!("RDAMVM{}", track.id)),
+        playlist_type: Some("radio".to_owned()),
+        endless_queue: true,
+        ..QueueStart::default()
+    }
 }
 
 fn queue_is_endless(playback: &PlaybackCoordinator) -> bool {

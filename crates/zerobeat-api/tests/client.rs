@@ -96,7 +96,9 @@ async fn queue_requests_use_signed_exact_json_bodies_and_backend_paths() {
     let track = Track::new("a", "A", "Artist", 120_000);
     let session = client
         .start_queue(QueueStart {
-            tracks: vec![track.clone()],
+            track: Some(track.clone()),
+            playlist_id: Some("RDAMVMa".into()),
+            playlist_type: Some("radio".into()),
             endless_queue: true,
             ..QueueStart::default()
         })
@@ -128,7 +130,9 @@ async fn queue_requests_use_signed_exact_json_bodies_and_backend_paths() {
     assert!(requests[2].starts_with("GET /music/v1/app/player/queue/session "));
     assert!(requests[2].contains("x-zerobeat-signature-version: v5"));
     assert!(requests[3].starts_with("POST /music/v1/app/player/queue/sessions "));
-    assert!(requests[3].ends_with("{\"tracks\":[{\"videoId\":\"a\",\"title\":\"A\",\"artist\":\"Artist\",\"durationSec\":120}],\"currentIndex\":0,\"shuffle\":false,\"repeatMode\":\"none\",\"endlessQueue\":true}"));
+    assert!(requests[3].ends_with("{\"tracks\":[],\"currentIndex\":0,\"track\":{\"videoId\":\"a\",\"title\":\"A\",\"artist\":\"Artist\",\"durationSec\":120},\"playlistId\":\"RDAMVMa\",\"playlistType\":\"radio\",\"shuffle\":false,\"repeatMode\":\"none\",\"endlessQueue\":true}"));
+    assert!(!requests[3].contains("playlistName"));
+    assert!(!requests[3].contains("continuation"));
     assert!(requests[3].contains("x-zerobeat-body-sha256: "));
     assert!(requests[4].starts_with("GET /music/v1/app/player/queue/sessions/session-1 "));
     assert!(requests[5].starts_with("POST /music/v1/app/player/queue/sessions/session-1/next "));

@@ -217,6 +217,120 @@ async fn search_runs_in_background_and_updates_the_snapshot() {
 }
 
 #[tokio::test]
+async fn direct_search_play_starts_a_radio_seed_queue() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let queue = TestQueue::default();
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+
+    let request = queue
+        .start_requests
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("captured queue start request");
+    assert!(request.tracks.is_empty());
+    assert_eq!(
+        request.track.as_ref().map(|track| track.id.as_str()),
+        Some("video-123")
+    );
+    assert_eq!(request.current_index, 0);
+    assert_eq!(request.playlist_id.as_deref(), Some("RDAMVMvideo-123"));
+    assert_eq!(request.playlist_type.as_deref(), Some("radio"));
+    assert!(request.endless_queue);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_track_play_replaces_old_queue_with_a_radio_seed() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("zerobeat.sock");
+    let queue = TestQueue::default();
+    let server = DaemonServer::bind_with_services_and_queue(
+        &socket,
+        TestCatalog,
+        queue.clone(),
+        RecordingBackend(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .await
+    .unwrap();
+    let server_task = tokio::spawn(server.run());
+    let mut client = IpcConnection::connect(&socket).await.unwrap();
+
+    exchange(&mut client, ClientCommand::UpdateSearch("tampar".into())).await;
+    exchange(&mut client, ClientCommand::SubmitSearch).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.search.status == SearchStatus::Ready
+    })
+    .await;
+    exchange(&mut client, ClientCommand::PlaySelected).await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+    })
+    .await;
+    exchange(&mut client, ClientCommand::QueueSelected).await;
+
+    exchange(
+        &mut client,
+        ClientCommand::PlayTrack(Track::new("direct", "Direct Pick", "ZeroBeat", 180_000)),
+    )
+    .await;
+    wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing
+            && snapshot
+                .playback
+                .current
+                .as_ref()
+                .is_some_and(|track| track.id == "direct")
+    })
+    .await;
+
+    let request = queue
+        .start_requests
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("captured direct queue start request");
+    assert!(request.tracks.is_empty());
+    assert_eq!(
+        request.track.as_ref().map(|track| track.id.as_str()),
+        Some("direct")
+    );
+    assert_eq!(request.current_index, 0);
+    assert_eq!(request.playlist_id.as_deref(), Some("RDAMVMdirect"));
+    assert_eq!(request.playlist_type.as_deref(), Some("radio"));
+    assert!(request.endless_queue);
+
+    exchange(&mut client, ClientCommand::Shutdown).await;
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
     let directory = tempdir().unwrap();
     let socket = directory.path().join("zerobeat.sock");
@@ -311,13 +425,22 @@ async fn playback_modes_history_mute_and_queue_controls_are_consistent() {
         previous.playback.current.as_ref().unwrap().title,
         "Direct Pick"
     );
-    let settled = wait_for(&mut client, |snapshot| {
+    wait_for(&mut client, |snapshot| {
         snapshot.playback.status == PlaybackStatus::Playing
             && snapshot
                 .playback
                 .current
                 .as_ref()
                 .is_some_and(|track| track.id == "direct")
+    })
+    .await;
+    exchange(
+        &mut client,
+        ClientCommand::QueueTrack(Track::new("queued", "Queued", "ZeroBeat", 180_000)),
+    )
+    .await;
+    let settled = wait_for(&mut client, |snapshot| {
+        snapshot.playback.status == PlaybackStatus::Playing && snapshot.playback.queue.len() == 1
     })
     .await;
     let queue_len = settled.playback.queue.len();
@@ -1341,6 +1464,7 @@ impl MusicCatalog for TestCatalog {
 #[derive(Clone, Default)]
 struct TestQueue {
     state: Arc<Mutex<Option<QueueSession>>>,
+    start_requests: Arc<Mutex<Vec<QueueStart>>>,
     index_calls: Arc<Mutex<Vec<usize>>>,
     next_calls: Arc<AtomicUsize>,
     next_terminal: bool,
@@ -1382,14 +1506,27 @@ impl MusicQueue for TestQueue {
 
     fn start_queue(&self, request: QueueStart) -> QueueFuture<'_, QueueSession> {
         let state = Arc::clone(&self.state);
+        let start_requests = Arc::clone(&self.start_requests);
         let finite = self.finite;
         let initial_upcoming = self.initial_upcoming;
         Box::pin(async move {
+            start_requests.lock().unwrap().push(request.clone());
+            let radio_seed = request.track.clone();
             let mut tracks = request.tracks;
             if let Some(track) = request.track
                 && !tracks.iter().any(|candidate| candidate.id == track.id)
             {
                 tracks.insert(request.current_index.min(tracks.len()), track);
+            }
+            if request.playlist_type.as_deref() == Some("radio")
+                && radio_seed
+                    .as_ref()
+                    .is_some_and(|track| track.id == "video-123")
+            {
+                tracks.extend([
+                    Track::new("video-456", "Sialan", "ZeroBeat", 240_000),
+                    Track::new("video-789", "Lampu Kuning", "ZeroBeat", 240_000),
+                ]);
             }
             if tracks.is_empty() {
                 return Err(zerobeat_catalog::CatalogError::InvalidResponse(
