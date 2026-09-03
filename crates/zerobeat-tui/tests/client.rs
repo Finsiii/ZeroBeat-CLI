@@ -6,7 +6,9 @@ use tempfile::tempdir;
 use tokio::net::UnixListener;
 use zerobeat_core::Route;
 use zerobeat_daemon::DaemonServer;
-use zerobeat_protocol::{ClientCommand, DaemonEvent};
+use zerobeat_protocol::ClientCommand;
+#[cfg(unix)]
+use zerobeat_protocol::DaemonEvent;
 #[cfg(unix)]
 use zerobeat_tui::ClientError;
 use zerobeat_tui::DaemonClient;
