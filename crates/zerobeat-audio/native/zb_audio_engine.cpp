@@ -1,3 +1,7 @@
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include "zb_audio_engine.h"
 
 #include "third_party/miniaudio/miniaudio.h"
