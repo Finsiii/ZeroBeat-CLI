@@ -312,7 +312,7 @@ jobs:
           for binary in zerobeat-cli zerobeatd; do
             binary_path="target/release/$binary"
             test -x "$binary_path"
-            readelf -h "$binary_path" | grep -Fq "Machine: AArch64"
+            readelf -h "$binary_path" | grep -Eq "Machine:.*AArch64"
             missing="$(ldd "$binary_path" | grep "not found" || true)"
             test -z "$missing"
             install -m 755 "$binary_path" "dist-arm64/stage/$binary"
@@ -378,7 +378,7 @@ jobs:
               for binary in zerobeat-cli zerobeatd; do
                 binary_path="$CARGO_TARGET_DIR/release/$binary"
                 test -x "$binary_path"
-                readelf -h "$binary_path" | grep -Fq "Machine: AArch64"
+                readelf -h "$binary_path" | grep -Eq "Machine:.*AArch64"
                 missing="$(ldd "$binary_path" | grep "not found" || true)"
                 test -z "$missing"
               done
