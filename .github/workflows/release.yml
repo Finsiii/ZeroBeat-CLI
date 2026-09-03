@@ -296,7 +296,7 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}\vcpkg-binary-cache
-          key: windows-2025-x64-vcpkg-ffmpeg-curl-sqlite-v1
+          key: windows-2025-x64-vcpkg-ffmpeg-curl-sqlite-v2
 
       - name: Initialize MSVC environment
         run: |
@@ -319,12 +319,16 @@ jobs:
           $env:VCPKG_ROOT = Split-Path -Parent $vcpkg
           $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-binary-cache'
           New-Item -ItemType Directory -Path $cache -Force | Out-Null
+          $env:VCPKG_DEFAULT_TRIPLET = 'x64-windows'
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$cache,readwrite"
           "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          'VCPKG_DEFAULT_TRIPLET=x64-windows' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_DEFAULT_TRIPLET=$env:VCPKG_DEFAULT_TRIPLET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_BINARY_SOURCES=$env:VCPKG_BINARY_SOURCES" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $sqliteRoot = Join-Path $env:VCPKG_ROOT 'installed\x64-windows'
-          "SQLITE3_LIB_DIR=$(Join-Path $sqliteRoot 'lib')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "SQLITE3_INCLUDE_DIR=$(Join-Path $sqliteRoot 'include')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:SQLITE3_LIB_DIR = Join-Path $sqliteRoot 'lib'
+          $env:SQLITE3_INCLUDE_DIR = Join-Path $sqliteRoot 'include'
+          "SQLITE3_LIB_DIR=$env:SQLITE3_LIB_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SQLITE3_INCLUDE_DIR=$env:SQLITE3_INCLUDE_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $vcpkg install 'ffmpeg:x64-windows' 'curl:x64-windows' 'sqlite3:x64-windows' --clean-after-build
 
       - name: Save vcpkg binary cache
@@ -333,7 +337,7 @@ jobs:
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}\vcpkg-binary-cache
-          key: windows-2025-x64-vcpkg-ffmpeg-curl-sqlite-v1
+          key: windows-2025-x64-vcpkg-ffmpeg-curl-sqlite-v2
 
       - name: Install pinned Rust toolchain
         run: |
