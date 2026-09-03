@@ -29,6 +29,7 @@ use crate::{DaemonError, download::spawn_download, stream_cache::StreamCache};
 
 pub struct DaemonServer {
     listener: IpcListener,
+    #[cfg(unix)]
     socket_path: PathBuf,
     playback: PlaybackCoordinator,
     catalog: Arc<dyn MusicCatalog>,
@@ -187,6 +188,7 @@ impl DaemonServer {
 
         Ok(Self {
             listener,
+            #[cfg(unix)]
             socket_path,
             playback: PlaybackCoordinator {
                 state: Arc::new(Mutex::new(state)),
