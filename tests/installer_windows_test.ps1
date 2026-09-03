@@ -18,9 +18,17 @@ function Assert-True([bool]$condition, [string]$message) {
 }
 
 function Invoke-Installer([string[]]$arguments) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer @arguments 2>&1 | Out-Null
-    $exitCode = $LASTEXITCODE
-    return [int]$exitCode
+    $stdout = Join-Path $testRoot ("installer-{0}.stdout" -f [guid]::NewGuid())
+    $stderr = Join-Path $testRoot ("installer-{0}.stderr" -f [guid]::NewGuid())
+    try {
+        $process = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer) + $arguments) `
+            -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        return [int]$process.ExitCode
+    } finally {
+        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    }
 }
 
 try {

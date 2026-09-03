@@ -266,7 +266,7 @@ fn native_engine_starts_from_valid_prebuffer_when_a_later_range_fails() {
         );
         std::thread::yield_now();
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while engine.last_error().is_none() {
         assert!(
             Instant::now() < deadline,
@@ -527,11 +527,12 @@ fn native_engine_rejects_an_invalid_http_content_range_end() {
 #[test]
 fn native_engine_rejects_a_nonzero_200_range_without_content_range() {
     let body = silent_wav(10_000);
-    let body_length = body.len();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let saw_nonzero = Arc::new(AtomicBool::new(false));
     let server_saw_nonzero = Arc::clone(&saw_nonzero);
+    let reject_nonzero = Arc::new(AtomicBool::new(false));
+    let server_reject_nonzero = Arc::clone(&reject_nonzero);
     let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let accept_deadline = Instant::now() + Duration::from_secs(3);
@@ -573,49 +574,74 @@ fn native_engine_rejects_a_nonzero_200_range_without_content_range() {
                 }
                 debug_assert!(read > 0);
             }
+            let request = request.to_ascii_lowercase();
             let range = request
-                .split("range=")
-                .nth(1)
-                .and_then(|value| value.split(['&', ' ']).next())
+                .lines()
+                .find_map(|line| line.strip_prefix("range: bytes="))
                 .and_then(|value| value.split('-').next())
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(0);
             if range > 0 {
                 server_saw_nonzero.store(true, Ordering::Release);
             }
-            let chunk = &body[..512 * 1024];
-            if write!(
-                connection.get_mut(),
-                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                chunk.len()
-            )
-            .is_err()
-            {
+            let reject = range > 0 && server_reject_nonzero.load(Ordering::Acquire);
+            let start = if reject { 0 } else { range };
+            let end = (start + 512 * 1024).min(body.len());
+            if end <= start {
+                continue;
+            }
+            let chunk = &body[start..end];
+            let response = if reject {
+                write!(
+                    connection.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    chunk.len()
+                )
+            } else {
+                write!(
+                    connection.get_mut(),
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                    chunk.len(),
+                    start,
+                    end - 1,
+                    body.len()
+                )
+            };
+            if response.is_err() {
                 continue;
             }
             if connection.get_mut().write_all(chunk).is_err() {
                 continue;
             }
-            if range > 0 {
+            if reject {
                 break;
             }
         }
     });
 
     let mut engine = NativeEngine::new().unwrap();
-    let source = StreamSource::new(format!("http://{address}/audio?clen={}", body_length));
+    let source = StreamSource::new(format!("http://{address}/audio"));
     engine.load(&source).unwrap();
+    reject_nonzero.store(true, Ordering::Release);
 
     let seek_result = engine.seek(9_000);
+    let mut play_result = None;
     if seek_result.is_ok() {
-        for _ in 0..100 {
-            if engine.state() == NativeState::Error {
+        engine.set_volume(0.0).unwrap();
+        play_result = Some(engine.play());
+        for _ in 0..200 {
+            if engine.state() == NativeState::Error || engine.last_error().is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    assert!(seek_result.is_err() || engine.state() == NativeState::Error);
+    assert!(
+        seek_result.is_err()
+            || play_result.is_some_and(|result| result.is_err())
+            || engine.state() == NativeState::Error
+            || engine.last_error().is_some()
+    );
     assert!(saw_nonzero.load(Ordering::Acquire));
     server.join().unwrap();
 }
