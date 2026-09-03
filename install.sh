@@ -22,14 +22,14 @@ usage() {
     cat <<'EOF'
 Usage: ./install.sh [--uninstall]
 
-Install the latest stable ZeroBeat Linux x86_64 release, or set VERSION=vX.Y.Z.
+Install the latest stable ZeroBeat Linux release, or set VERSION=vX.Y.Z.
 Set PREFIX to choose a destination (default: $HOME/.local). The installer never
 uses sudo and never removes user data.
 
 Examples:
   ./install.sh
-  VERSION=v0.1.4 ./install.sh
-  PREFIX=/usr/local VERSION=v0.1.4 ./install.sh
+  VERSION=v0.1.5 ./install.sh
+  PREFIX=/usr/local VERSION=v0.1.5 ./install.sh
   ./install.sh --uninstall
 EOF
 }
@@ -68,7 +68,23 @@ resolve_prefix() {
 
 resolve_prefix
 [ "$(uname -s)" = Linux ] || die 'only Linux is supported'
-[ "$(uname -m)" = x86_64 ] || die 'only Linux x86_64 is supported'
+TARGET_ARCH=$(uname -m)
+if [ "${ZEROBEAT_ALLOW_LOCAL_TEST:-0}" = 1 ] && [ -n "${ZEROBEAT_UNAME_M:-}" ]; then
+    TARGET_ARCH=$ZEROBEAT_UNAME_M
+fi
+case "$TARGET_ARCH" in
+    x86_64)
+        ELF_MACHINE_PATTERN='(Advanced Micro Devices X86-64|X86-64)'
+        ELF_ARCH_LABEL='x86-64'
+        LDCONFIG_ARCH_PATTERN='x86-64'
+        ;;
+    aarch64)
+        ELF_MACHINE_PATTERN='AArch64'
+        ELF_ARCH_LABEL='AArch64'
+        LDCONFIG_ARCH_PATTERN='AArch64'
+        ;;
+    *) die 'only Linux x86_64 or aarch64 is supported' ;;
+esac
 
 reject_path_components() {
     path=$1
@@ -204,7 +220,8 @@ command -v curl >/dev/null 2>&1 || die 'curl is required'
 command -v tar >/dev/null 2>&1 || die 'tar is required'
 command -v mktemp >/dev/null 2>&1 || die 'mktemp is required'
 command -v install >/dev/null 2>&1 || die 'install is required'
-command -v readelf >/dev/null 2>&1 || die 'readelf is required to validate ELF files'
+command -v readelf >/dev/null 2>&1 ||
+    die 'readelf is required to validate ELF files (Debian/Ubuntu: sudo apt-get install binutils)'
 command -v ldconfig >/dev/null 2>&1 || die 'ldconfig is required to validate shared-library dependencies'
 command -v cp >/dev/null 2>&1 || die 'cp is required'
 
@@ -223,7 +240,7 @@ case "$VERSION" in
     v[0-9]*)
         BASE_URL=${ZEROBEAT_RELEASE_BASE_URL:-"https://github.com/$REPOSITORY/releases/download/$VERSION"}
         ;;
-    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.4)' ;;
+    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.5)' ;;
 esac
 
 case "$BASE_URL" in
@@ -238,8 +255,12 @@ esac
 
 read_os_release_value() {
     key=$1
-    [ -r /etc/os-release ] || return 1
-    value=$(sed -n "s/^${key}=//p" /etc/os-release | sed -n '1p')
+    os_release_path=/etc/os-release
+    if [ "${ZEROBEAT_ALLOW_LOCAL_TEST:-0}" = 1 ] && [ -n "${ZEROBEAT_OS_RELEASE:-}" ]; then
+        os_release_path=$ZEROBEAT_OS_RELEASE
+    fi
+    [ -r "$os_release_path" ] || return 1
+    value=$(sed -n "s/^${key}=//p" "$os_release_path" | sed -n '1p')
     value=${value#\"}
     value=${value%\"}
     [ -n "$value" ] || return 1
@@ -250,6 +271,8 @@ DISTRO_ID=$(read_os_release_value ID) || die 'could not identify Linux distribut
 DISTRO_VERSION=$(read_os_release_value VERSION_ID || true)
 case "$DISTRO_ID" in
     arch)
+        [ "$TARGET_ARCH" = x86_64 ] ||
+            die 'unsupported Arch Linux architecture; prebuilt release requires x86_64'
         if ldconfig -p | grep -F 'libavformat.so.62 ' >/dev/null 2>&1 &&
             ldconfig -p | grep -F 'libavcodec.so.62 ' >/dev/null 2>&1 &&
             ldconfig -p | grep -F 'libavutil.so.60 ' >/dev/null 2>&1 &&
@@ -267,10 +290,24 @@ case "$DISTRO_ID" in
     ubuntu)
         [ "$DISTRO_VERSION" = 24.04 ] ||
             die "unsupported Ubuntu version: ${DISTRO_VERSION:-unknown}; prebuilt release requires Ubuntu 24.04"
-        ARCHIVE_NAME=zerobeat-linux-x86_64.tar.gz
+        case "$TARGET_ARCH" in
+            x86_64) ARCHIVE_NAME=zerobeat-linux-x86_64.tar.gz ;;
+            aarch64) ARCHIVE_NAME=zerobeat-linux-ubuntu24-aarch64.tar.gz ;;
+            *) die 'unsupported Ubuntu architecture; prebuilt release requires x86_64 or aarch64' ;;
+        esac
+        ;;
+    debian)
+        case "$DISTRO_VERSION:$TARGET_ARCH" in
+            12:x86_64) ARCHIVE_NAME=zerobeat-linux-debian12-x86_64.tar.gz ;;
+            13:x86_64) ARCHIVE_NAME=zerobeat-linux-debian13-x86_64.tar.gz ;;
+            12:aarch64) ARCHIVE_NAME=zerobeat-linux-debian12-aarch64.tar.gz ;;
+            13:aarch64) ARCHIVE_NAME=zerobeat-linux-debian13-aarch64.tar.gz ;;
+            12:*|13:*) die "unsupported Debian architecture: $TARGET_ARCH; prebuilt release requires x86_64 or aarch64" ;;
+            *) die "unsupported Debian version: ${DISTRO_VERSION:-unknown}; prebuilt release requires Debian 12 or 13" ;;
+        esac
         ;;
     *)
-        die "unsupported Linux distribution: $DISTRO_ID; prebuilt releases support Arch Linux and Ubuntu 24.04"
+        die "unsupported Linux distribution: $DISTRO_ID; prebuilt releases support Arch Linux, Debian 12/13, and Ubuntu 24.04"
         ;;
 esac
 
@@ -344,8 +381,8 @@ validate_elf() {
     readelf -h "$path" > "$header" 2>&1 || die "readelf could not inspect $label"
     grep -E 'Class:.*ELF64' "$header" >/dev/null 2>&1 ||
         die "$label is not an ELF64 binary"
-    grep -E 'Machine:.*(Advanced Micro Devices X86-64|X86-64)' "$header" >/dev/null 2>&1 ||
-        die "$label is not an x86-64 binary"
+    grep -E "Machine:.*$ELF_MACHINE_PATTERN" "$header" >/dev/null 2>&1 ||
+        die "$label is not an $ELF_ARCH_LABEL binary"
 
     readelf -l "$path" > "$program" 2>&1 || die "readelf could not inspect $label program headers"
     interpreter=$(sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' "$program")
@@ -360,7 +397,7 @@ validate_elf() {
     [ -n "$needed" ] || die "$label has no dynamic dependencies"
     while IFS= read -r soname; do
         [ -n "$soname" ] || continue
-        if ! ldconfig -p | awk -v name="$soname" '$1 == name && $0 ~ /x86-64/ { found=1 } END { exit(found ? 0 : 1) }'; then
+        if ! ldconfig -p | awk -v name="$soname" -v arch="$LDCONFIG_ARCH_PATTERN" '$1 == name && $0 ~ arch { found=1 } END { exit(found ? 0 : 1) }'; then
             die "$label has an unavailable shared-library dependency: $soname"
         fi
     done <<EOF

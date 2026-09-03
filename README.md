@@ -17,9 +17,16 @@ TUI, a small per-user daemon, native audio playback, and a local library.
 ZeroBeat Native DJ remains exclusive to the Android app. The Linux CLI uses
 the lightweight native playback and crossfade engine.
 
-The official prebuilt targets are Ubuntu 24.04 Linux x86_64 and Arch Linux
-x86_64. ARM, macOS, Windows, and other targets are not official release
-targets.
+Official prebuilt targets:
+
+- Debian 12 and 13 on x86_64 and ARM64, including matching Chromebook Linux
+  Development Environments (Crostini).
+- Ubuntu 24.04 on x86_64 and ARM64.
+- Arch Linux on x86_64 with FFmpeg 8 or 9.
+
+ChromeOS itself is not targeted directly; run ZeroBeat inside the Chromebook
+Linux environment. macOS, Windows, 32-bit Linux, and other distributions are
+not official release targets yet.
 
 ## Quick install
 
@@ -48,17 +55,38 @@ and sh "$installer"
 and rm -f "$installer"
 ```
 
-The command uses only `curl`, the shell, and standard system utilities; it
-does not require `less` or another optional viewer. On Ubuntu 24.04 the
-installer selects `zerobeat-linux-x86_64.tar.gz`. On Arch Linux it detects
-the installed FFmpeg ABI and selects the matching FFmpeg 8 or FFmpeg 9 build.
-Other distro/version targets are rejected. The installer requires a writable
-absolute `PREFIX`; by default it uses `$HOME/.local`.
+The command does not require `less` or another pager. It needs `curl`,
+`binutils` (for `readelf`), and the normal media runtime libraries. On a fresh
+Debian, Ubuntu, or Chromebook Linux environment, install them once with:
 
-Add the default bin directory to the current shell and start the player:
+```bash
+sudo apt-get update
+sudo apt-get install --yes curl ca-certificates binutils ffmpeg \
+  libsqlite3-0 libasound2 libpulse0 libpipewire-0.3-0
+```
+
+The installer selects the archive for the detected distribution, version, and
+CPU architecture. Arch Linux also selects the matching FFmpeg 8 or FFmpeg 9
+build. Unsupported targets are rejected before anything is installed. The
+installer requires a writable absolute `PREFIX`; by default it uses
+`$HOME/.local`.
+
+On a Chromebook, enable **Linux development environment**, open its Terminal,
+and run the same command above. Debian 12/13 Crostini containers are supported
+on both Intel/AMD and ARM64 Chromebooks. Existing containers may need their
+normal system packages updated before installing ZeroBeat.
+
+Add the default bin directory to Bash or Zsh and start the player:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
+zerobeat-cli
+```
+
+For Fish:
+
+```fish
+fish_add_path $HOME/.local/bin
 zerobeat-cli
 ```
 
@@ -81,16 +109,24 @@ refuses to remove files that are missing, modified, unowned, or symlinks.
 
 ## Manual release installation
 
-Download the platform-specific archive and checksum for v0.1.4, then verify
+Download the platform-specific archive and checksum for v0.1.5, then verify
 before extracting. Choose exactly one archive name:
 
 ```bash
-version=v0.1.4
+version=v0.1.5
 base="https://github.com/Finsiii/ZeroBeat-CLI/releases/download/$version"
 mkdir -p "$HOME/tmp/zerobeat-$version"
 cd "$HOME/tmp/zerobeat-$version"
-# Ubuntu 24.04:
+# Ubuntu 24.04 x86_64:
 archive=zerobeat-linux-x86_64.tar.gz
+# Ubuntu 24.04 ARM64:
+# archive=zerobeat-linux-ubuntu24-aarch64.tar.gz
+# Debian 12 x86_64 / ARM64:
+# archive=zerobeat-linux-debian12-x86_64.tar.gz
+# archive=zerobeat-linux-debian12-aarch64.tar.gz
+# Debian 13 x86_64 / ARM64:
+# archive=zerobeat-linux-debian13-x86_64.tar.gz
+# archive=zerobeat-linux-debian13-aarch64.tar.gz
 # Arch Linux with FFmpeg 8:
 # archive=zerobeat-linux-arch-ffmpeg8-x86_64.tar.gz
 # Arch Linux with FFmpeg 9:
@@ -121,6 +157,17 @@ zerobeat-cli
 The native audio build needs a C++20 compiler, `pkg-config`, SQLite, curl,
 FFmpeg (`avformat`, `avcodec`, `avutil`, and `swresample`), and an audio
 backend. The repository pins Rust toolchain 1.96.0.
+
+Debian 12/13, including Chromebook Linux environments:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes \
+  build-essential pkg-config curl \
+  libsqlite3-dev libcurl4-openssl-dev \
+  libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+  libasound2-dev libpulse-dev libpipewire-0.3-dev
+```
 
 Ubuntu 24.04:
 

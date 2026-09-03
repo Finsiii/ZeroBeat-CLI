@@ -40,7 +40,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-targets --locked
+        run: |
+          cargo test --workspace --all-targets --locked
+          sh tests/installer_distro_test.sh
 
       - name: Build release binaries
         run: cargo build --workspace --release --locked
@@ -48,8 +50,9 @@ jobs:
       - name: Validate release shell
         run: |
           sh -n install.sh
+          sh -n tests/installer_distro_test.sh
           bash -n scripts/benchmark.sh
-          shellcheck install.sh scripts/benchmark.sh
+          shellcheck install.sh scripts/benchmark.sh tests/installer_distro_test.sh
 
       - name: Check native shared-library resolution
         run: |
