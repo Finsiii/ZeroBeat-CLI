@@ -322,6 +322,9 @@ jobs:
           "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           'VCPKG_DEFAULT_TRIPLET=x64-windows' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $sqliteRoot = Join-Path $env:VCPKG_ROOT 'installed\x64-windows'
+          "SQLITE3_LIB_DIR=$(Join-Path $sqliteRoot 'lib')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SQLITE3_INCLUDE_DIR=$(Join-Path $sqliteRoot 'include')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $vcpkg install 'ffmpeg:x64-windows' 'curl:x64-windows' 'sqlite3:x64-windows' --clean-after-build
 
       - name: Save vcpkg binary cache

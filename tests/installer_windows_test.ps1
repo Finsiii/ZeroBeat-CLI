@@ -18,8 +18,9 @@ function Assert-True([bool]$condition, [string]$message) {
 }
 
 function Invoke-Installer([string[]]$arguments) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer @arguments
-    return $LASTEXITCODE
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer @arguments *> $null
+    $exitCode = $LASTEXITCODE
+    return [int]$exitCode
 }
 
 try {
