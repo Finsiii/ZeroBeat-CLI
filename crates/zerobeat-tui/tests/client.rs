@@ -1,12 +1,17 @@
+#[cfg(unix)]
 use std::time::Duration;
 
 use tempfile::tempdir;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use zerobeat_core::Route;
 use zerobeat_daemon::DaemonServer;
 use zerobeat_protocol::{ClientCommand, DaemonEvent};
-use zerobeat_tui::{ClientError, DaemonClient};
+#[cfg(unix)]
+use zerobeat_tui::ClientError;
+use zerobeat_tui::DaemonClient;
 
+#[cfg(unix)]
 #[tokio::test]
 async fn client_connect_times_out_on_a_silent_hello_peer() {
     let directory = tempdir().unwrap();
@@ -27,6 +32,7 @@ async fn client_connect_times_out_on_a_silent_hello_peer() {
     server.await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn client_shutdown_times_out_on_a_silent_shutdown_peer() {
     let directory = tempdir().unwrap();

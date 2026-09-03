@@ -1,12 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::NativeCancellationHandle;
 use crate::{BackendError, StreamSource};
 
 pub const SPECTRUM_BAND_COUNT: usize = 24;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub type CancellationController = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,19 +76,19 @@ pub trait AudioBackend: Send {
         None
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn cancellation_handle(&self) -> Option<NativeCancellationHandle> {
         None
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn cancel_current_load(&self) {
         if let Some(handle) = self.cancellation_handle() {
             handle.cancel();
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn cancellation_controller(&self) -> Option<CancellationController> {
         self.cancellation_handle()
             .map(|handle| Arc::new(move || handle.cancel()) as CancellationController)

@@ -1,17 +1,19 @@
 use std::{
     fs,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
 
 use zerobeat_ipc::{IpcError, PeerCredentials};
+#[cfg(unix)]
 use zerobeat_protocol::{ClientCommand, DaemonEvent, PROTOCOL_VERSION};
+#[cfg(unix)]
 use zerobeat_runtime::prepare_runtime_dir;
 
 use crate::{ClientError, DaemonClient};
 
+#[cfg(unix)]
 const LEGACY_DAEMON_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +29,7 @@ pub enum LaunchError {
 }
 
 pub async fn connect_or_spawn(socket: &Path) -> Result<DaemonClient, LaunchError> {
+    #[cfg(unix)]
     if let Some(parent) = socket.parent() {
         prepare_runtime_dir(parent)?;
     }
@@ -108,13 +111,24 @@ async fn wait_for_socket_release(
     .into())
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExecutableIdentity {
     device: u64,
     inode: u64,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
+
+#[cfg(unix)]
 fn daemon_executable_identity(path: &Path) -> std::io::Result<ExecutableIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
     let metadata = fs::metadata(path)?;
     Ok(ExecutableIdentity {
         device: metadata.dev(),
@@ -122,8 +136,58 @@ fn daemon_executable_identity(path: &Path) -> std::io::Result<ExecutableIdentity
     })
 }
 
+#[cfg(windows)]
+fn daemon_executable_identity(path: &Path) -> std::io::Result<ExecutableIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = fs::File::open(path)?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ExecutableIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(unix)]
 fn peer_executable_identity(pid: u32) -> std::io::Result<ExecutableIdentity> {
     daemon_executable_identity(&PathBuf::from(format!("/proc/{pid}/exe")))
+}
+
+#[cfg(windows)]
+fn peer_executable_identity(pid: u32) -> std::io::Result<ExecutableIdentity> {
+    use std::os::windows::ffi::OsStringExt;
+
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        },
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = u32::try_from(buffer.len()).unwrap();
+    let result =
+        unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) };
+    unsafe { CloseHandle(process) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(length as usize);
+    daemon_executable_identity(&PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
 }
 
 fn connected_daemon_is_current(
@@ -134,12 +198,20 @@ fn connected_daemon_is_current(
     let credentials = client.peer_credentials().map_err(|error| {
         LaunchError::Security(format!("failed to read daemon peer credentials: {error}"))
     })?;
-    let Some(parent) = socket.parent() else {
-        return Err(LaunchError::Security(
-            "daemon socket has no parent directory".into(),
-        ));
-    };
-    verify_peer_identity(credentials, parent, daemon)
+    #[cfg(unix)]
+    {
+        let Some(parent) = socket.parent() else {
+            return Err(LaunchError::Security(
+                "daemon socket has no parent directory".into(),
+            ));
+        };
+        verify_peer_identity(credentials, parent, daemon)
+    }
+    #[cfg(windows)]
+    {
+        let _ = socket;
+        verify_peer_identity(credentials, Path::new(""), daemon)
+    }
 }
 
 fn verify_peer_identity(
@@ -147,16 +219,23 @@ fn verify_peer_identity(
     socket_parent: &Path,
     daemon: &Path,
 ) -> Result<bool, LaunchError> {
-    let owner = fs::metadata(socket_parent).map_err(|error| {
-        LaunchError::Security(format!("failed to inspect runtime directory: {error}"))
-    })?;
-    if credentials.uid != owner.uid() {
-        return Err(LaunchError::Security(format!(
-            "daemon peer UID {} does not own runtime directory (owner UID {})",
-            credentials.uid,
-            owner.uid()
-        )));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let owner = fs::metadata(socket_parent).map_err(|error| {
+            LaunchError::Security(format!("failed to inspect runtime directory: {error}"))
+        })?;
+        if credentials.uid != owner.uid() {
+            return Err(LaunchError::Security(format!(
+                "daemon peer UID {} does not own runtime directory (owner UID {})",
+                credentials.uid,
+                owner.uid()
+            )));
+        }
     }
+    #[cfg(windows)]
+    let _ = socket_parent;
     let Some(pid) = credentials.pid else {
         return Err(LaunchError::Security(
             "daemon peer did not provide a PID".into(),
@@ -175,6 +254,13 @@ fn verify_peer_identity(
     Ok(actual == expected)
 }
 
+#[cfg(windows)]
+async fn retire_legacy_daemon(current_socket: &Path, daemon: &Path) -> Result<(), LaunchError> {
+    let _ = (current_socket, daemon);
+    Ok(())
+}
+
+#[cfg(unix)]
 async fn retire_legacy_daemon(current_socket: &Path, daemon: &Path) -> Result<(), LaunchError> {
     let Some(parent) = current_socket.parent() else {
         return Ok(());
@@ -252,10 +338,14 @@ fn daemon_executable() -> Result<PathBuf, std::io::Error> {
         return Ok(path.into());
     }
     let current = std::env::current_exe()?;
-    Ok(current.with_file_name("zerobeatd"))
+    Ok(current.with_file_name(if cfg!(windows) {
+        "zerobeatd.exe"
+    } else {
+        "zerobeatd"
+    }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{fs, os::unix::fs::MetadataExt, process};
 

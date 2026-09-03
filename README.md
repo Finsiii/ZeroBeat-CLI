@@ -23,10 +23,11 @@ Official prebuilt targets:
   Development Environments (Crostini).
 - Ubuntu 24.04 on x86_64 and ARM64.
 - Arch Linux on x86_64 with FFmpeg 8 or 9.
+- Windows x64 (native MSVC build).
 
 ChromeOS itself is not targeted directly; run ZeroBeat inside the Chromebook
-Linux environment. macOS, Windows, 32-bit Linux, and other distributions are
-not official release targets yet.
+Linux environment. macOS, 32-bit Linux, and other distributions are not
+official release targets yet.
 
 ## Quick install
 
@@ -107,13 +108,67 @@ Uninstall removes only the two verified executables and the install manifest;
 it preserves the database, downloads, identity, and other user data. It
 refuses to remove files that are missing, modified, unowned, or symlinks.
 
+## Windows x64 install
+
+Open PowerShell and download the installer to a temporary file before running
+it. The installer downloads `zerobeat-windows-x86_64.zip` over HTTPS, verifies
+its SHA-256 checksum, and installs per-user by default; no administrator
+access is required:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$installer = Join-Path $env:TEMP 'zerobeat-install.ps1'
+Invoke-WebRequest -UseBasicParsing `
+  -Uri 'https://raw.githubusercontent.com/Finsiii/ZeroBeat-CLI/main/install.ps1' `
+  -OutFile $installer
+try {
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
+} finally {
+  Remove-Item -LiteralPath $installer -Force
+}
+```
+
+The default prefix is `$env:LOCALAPPDATA\Programs\ZeroBeat`, and it is added
+to the per-user `PATH`; open a new terminal after installation and run:
+
+```powershell
+zerobeat-cli.exe
+```
+
+Install a specific release or choose another user-writable prefix with
+`-Version vX.Y.Z` and `-Prefix C:\path\to\ZeroBeat`. Use `-NoPath` to skip the
+per-user `PATH` update. To uninstall, run the downloaded script with
+`-Uninstall -Prefix $env:LOCALAPPDATA\Programs\ZeroBeat`; modified or
+unmanifested files are never removed, and user data is preserved.
+
+For manual verification, download the archive and its checksum from the
+release page, then run:
+
+```powershell
+$version = 'v0.1.6'
+$base = "https://github.com/Finsiii/ZeroBeat-CLI/releases/download/$version"
+$archive = 'zerobeat-windows-x86_64.zip'
+Invoke-WebRequest -UseBasicParsing "$base/$archive" -OutFile $archive
+Invoke-WebRequest -UseBasicParsing "$base/$archive.sha256" -OutFile "$archive.sha256"
+$expected = (Get-Content "$archive.sha256").Trim().Split()[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+if ($expected -ne $actual) { throw 'archive SHA-256 verification failed' }
+Expand-Archive -LiteralPath $archive -DestinationPath .\zerobeat -Force
+```
+
+Optionally verify GitHub build provenance with GitHub CLI:
+
+```powershell
+gh attestation verify $archive --repo Finsiii/ZeroBeat-CLI
+```
+
 ## Manual release installation
 
-Download the platform-specific archive and checksum for v0.1.5, then verify
+Download the platform-specific archive and checksum for v0.1.6, then verify
 before extracting. Choose exactly one archive name:
 
 ```bash
-version=v0.1.5
+version=v0.1.6
 base="https://github.com/Finsiii/ZeroBeat-CLI/releases/download/$version"
 mkdir -p "$HOME/tmp/zerobeat-$version"
 cd "$HOME/tmp/zerobeat-$version"
@@ -233,9 +288,8 @@ for ownership and symlinks.
 
 The client creates a per-device signing identity with private file permissions;
 API requests are signed and no API secret is embedded in the binaries or
-README. The installer verifies checksums, restricts the archive contents,
-validates both ELF dependencies, rejects unsafe symlink paths, and records an
-ownership-checked manifest.
+README. The installers verify checksums, restrict archive contents, validate
+platform binaries and dependencies, reject unsafe paths, and record a manifest.
 
 - `zerobeat-cli: command not found`: run `export PATH="$HOME/.local/bin:$PATH"`
   or invoke the absolute path under your chosen prefix.
@@ -247,6 +301,10 @@ ownership-checked manifest.
 - Search or stream errors: confirm network access and inspect
   `ZEROBEAT_API_URL`. The daemon is started by the TUI; it should not need to
   be launched manually.
+- Windows `zerobeat-cli.exe: command not found`: open a new terminal after
+  installation, or invoke the executable from the selected prefix.
+- Windows audio errors: confirm that a Windows audio output device is enabled
+  and available to the current user.
 
 ## Benchmarking
 

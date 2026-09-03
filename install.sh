@@ -28,8 +28,8 @@ uses sudo and never removes user data.
 
 Examples:
   ./install.sh
-  VERSION=v0.1.5 ./install.sh
-  PREFIX=/usr/local VERSION=v0.1.5 ./install.sh
+  VERSION=v0.1.6 ./install.sh
+  PREFIX=/usr/local VERSION=v0.1.6 ./install.sh
   ./install.sh --uninstall
 EOF
 }
@@ -240,7 +240,7 @@ case "$VERSION" in
     v[0-9]*)
         BASE_URL=${ZEROBEAT_RELEASE_BASE_URL:-"https://github.com/$REPOSITORY/releases/download/$VERSION"}
         ;;
-    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.5)' ;;
+    *) die 'VERSION must be latest or a tag beginning with v (for example v0.1.6)' ;;
 esac
 
 case "$BASE_URL" in

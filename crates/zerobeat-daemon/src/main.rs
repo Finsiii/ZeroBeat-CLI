@@ -4,7 +4,9 @@ use zerobeat_api::{ApiCatalog, ApiConfig};
 use zerobeat_audio::{DualDeck, NativeEngine};
 use zerobeat_daemon::DaemonServer;
 use zerobeat_protocol::PROTOCOL_VERSION;
-use zerobeat_runtime::{current_data_dir, prepare_data_dir, prepare_runtime_dir, socket_path};
+#[cfg(unix)]
+use zerobeat_runtime::prepare_runtime_dir;
+use zerobeat_runtime::{current_data_dir, prepare_data_dir, socket_path};
 use zerobeat_storage::Database;
 
 const DEFAULT_API_URL: &str = "https://api.zerobits.tech/music";
@@ -12,7 +14,9 @@ const DEFAULT_API_URL: &str = "https://api.zerobits.tech/music";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let socket = parse_socket(std::env::args_os().skip(1))?;
+    #[cfg(unix)]
     let parent = socket.parent().ok_or("socket path has no parent")?;
+    #[cfg(unix)]
     prepare_runtime_dir(parent)?;
     let data_directory = current_data_dir()?;
     prepare_data_dir(&data_directory)?;

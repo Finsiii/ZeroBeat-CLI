@@ -1,3 +1,5 @@
+#![cfg(any(target_os = "linux", target_os = "windows"))]
+
 use std::{
     io::{BufRead, BufReader, ErrorKind, Read, Write},
     net::TcpListener,

@@ -59,3 +59,76 @@ jobs:
           missing="$(ldd target/release/zerobeat-cli | grep 'not found' || true)"
           missing="$missing$(ldd target/release/zerobeatd | grep 'not found' || true)"
           test -z "$missing"
+
+  verify-windows:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}\vcpkg-binary-cache
+          key: windows-2025-x64-vcpkg-ffmpeg-curl-sqlite-v1
+
+      - name: Initialize MSVC environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw 'MSVC installation was not found' }
+          $vsdevcmd = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
+          $environment = & $env:ComSpec /d /s /c "`"$vsdevcmd`" -arch=x64 -host_arch=x64 >nul && set"
+          foreach ($line in $environment) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+      - name: Configure vcpkg dependencies
+        run: |
+          $vcpkgCommand = Get-Command vcpkg.exe -ErrorAction SilentlyContinue
+          $vcpkg = if ($vcpkgCommand) { $vcpkgCommand.Source } elseif ($env:VCPKG_INSTALLATION_ROOT) { Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe' } else { throw 'vcpkg.exe was not found' }
+          $env:VCPKG_ROOT = Split-Path -Parent $vcpkg
+          $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-binary-cache'
+          New-Item -ItemType Directory -Path $cache -Force | Out-Null
+          "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          'VCPKG_DEFAULT_TRIPLET=x64-windows' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $vcpkg install 'ffmpeg:x64-windows' 'curl:x64-windows' 'sqlite3:x64-windows' --clean-after-build
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup component add --toolchain 1.96.0 rustfmt clippy
+          rustup default 1.96.0
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Windows tests
+        run: |
+          cargo test --workspace --all-targets --locked
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/installer_windows_test.ps1
+
+      - name: Build Windows release binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows PE binaries
+        run: |
+          foreach ($name in @('zerobeat-cli.exe', 'zerobeatd.exe')) {
+            $path = Join-Path 'target\release' $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "missing release binary: $name" }
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $path))
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "$name is not a PE executable" }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length -or $bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or $bytes[$peOffset + 2] -ne 0 -or $bytes[$peOffset + 3] -ne 0) { throw "$name has an invalid PE header" }
+            if ([BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664) { throw "$name is not x64" }
+          }

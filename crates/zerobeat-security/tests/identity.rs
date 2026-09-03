@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -5,6 +6,7 @@ use p256::ecdsa::{Signature, signature::Verifier};
 use tempfile::tempdir;
 use zerobeat_security::{DeviceIdentity, IdentityStore, RequestToSign};
 
+#[cfg(unix)]
 #[test]
 fn identity_survives_reopen_with_private_permissions() {
     let directory = tempdir().unwrap();
@@ -62,4 +64,31 @@ fn v5_request_signature_binds_every_canonical_field() {
     assert_eq!(signed.headers["X-ZeroBeat-Request-Counter"], "1");
     assert!(signed.canonical.contains("\nq=tampar&limit=20\n"));
     assert!(signed.canonical.contains("\ndevice-123\n"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_identity_round_trip_is_atomic_and_reopenable() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("device.identity");
+    let first = IdentityStore::load_or_create(&path, "cli/0.1.0+1").unwrap();
+    let install_id = first.install_id().to_owned();
+    IdentityStore::save(&path, &first).unwrap();
+    let reopened = IdentityStore::load(&path).unwrap();
+    assert_eq!(reopened.install_id(), install_id);
+    assert!(!path.with_extension("tmp").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_identity_rejects_reparse_point() {
+    let directory = tempdir().unwrap();
+    let target = directory.path().join("target.identity");
+    let link = directory.path().join("device.identity");
+    std::fs::write(&target, b"not an identity").unwrap();
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+    assert!(matches!(
+        IdentityStore::load(&link),
+        Err(zerobeat_security::SecurityError::UnsafeIdentity)
+    ));
 }

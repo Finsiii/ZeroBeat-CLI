@@ -280,8 +280,174 @@ jobs:
               --generate-notes
           fi
 
-  release-arm64:
+  release-windows:
     needs: release
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}\vcpkg-binary-cache
+          key: windows-2025-x64-vcpkg-ffmpeg-curl-sqlite-v1
+
+      - name: Initialize MSVC environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw 'MSVC installation was not found' }
+          $vsdevcmd = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
+          $environment = & $env:ComSpec /d /s /c "`"$vsdevcmd`" -arch=x64 -host_arch=x64 >nul && set"
+          foreach ($line in $environment) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+      - name: Configure vcpkg dependencies
+        run: |
+          $vcpkgCommand = Get-Command vcpkg.exe -ErrorAction SilentlyContinue
+          $vcpkg = if ($vcpkgCommand) { $vcpkgCommand.Source } elseif ($env:VCPKG_INSTALLATION_ROOT) { Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe' } else { throw 'vcpkg.exe was not found' }
+          $env:VCPKG_ROOT = Split-Path -Parent $vcpkg
+          $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-binary-cache'
+          New-Item -ItemType Directory -Path $cache -Force | Out-Null
+          "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          'VCPKG_DEFAULT_TRIPLET=x64-windows' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $vcpkg install 'ffmpeg:x64-windows' 'curl:x64-windows' 'sqlite3:x64-windows' --clean-after-build
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup component add --toolchain 1.96.0 rustfmt clippy
+          rustup default 1.96.0
+
+      - name: Verify source and Windows installer
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --all-targets --locked
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/installer_windows_test.ps1
+
+      - name: Build and package Windows x64 archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo build --workspace --release --locked
+          $installation = & (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe') -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem (Join-Path $installation 'VC\Tools\MSVC') -Filter dumpbin.exe -Recurse | Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin\.exe$' } | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe was not found' }
+          $vcpkgBin = Join-Path $env:VCPKG_ROOT 'installed\x64-windows\bin'
+          $redistRoots = @()
+          $redistBase = Join-Path $installation 'VC\Redist\MSVC'
+          if (Test-Path -LiteralPath $redistBase) { $redistRoots = @(Get-ChildItem $redistBase -Directory -Recurse | Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC.*\.CRT$' } | ForEach-Object FullName) }
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist-windows'
+          $stage = Join-Path $dist 'stage'
+          Remove-Item -LiteralPath $dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          foreach ($name in @('zerobeat-cli.exe', 'zerobeatd.exe')) {
+            $path = Join-Path 'target\release' $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "missing release binary: $name" }
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $path))
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "$name is not a PE executable" }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length -or $bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or $bytes[$peOffset + 2] -ne 0 -or $bytes[$peOffset + 3] -ne 0) { throw "$name has an invalid PE header" }
+            if ([BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664) { throw "$name is not x64" }
+          }
+          Copy-Item target\release\zerobeat-cli.exe, target\release\zerobeatd.exe, README.md, LICENSE -Destination $stage
+
+          $systemDll = '^(api-ms-win-|ext-ms-win-)|^(kernel32|kernelbase|ntdll|advapi32|user32|gdi32|ole32|oleaut32|shell32|ws2_32|bcrypt|crypt32|secur32|userenv|version|winmm|shlwapi|msvcrt|ucrtbase)\.dll$'
+          $systemDllRoots = @()
+          if ($env:SystemRoot) { $systemDllRoots = @((Join-Path $env:SystemRoot 'System32'), (Join-Path $env:SystemRoot 'SysWOW64')) }
+          $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+          $pending = @((Get-ChildItem $stage -Filter '*.exe' -File).FullName)
+          while ($pending.Count -gt 0) {
+            $current = $pending[0]
+            $pending = @($pending | Select-Object -Skip 1)
+            $currentName = Split-Path -Leaf $current
+            if (-not $visited.Add($currentName)) { continue }
+            $dumpbinOutput = & $dumpbin.FullName /nologo /DEPENDENTS $current 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $current" }
+            $dependencies = $dumpbinOutput | ForEach-Object {
+              if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $Matches[1] }
+            }
+            foreach ($dependency in $dependencies) {
+              if ($dependency -match $systemDll) { continue }
+              if ($systemDllRoots | Where-Object { Test-Path -LiteralPath (Join-Path $_ $dependency) }) { continue }
+              if ($dependency -match '(?i)(-d|_d|debug)\.dll$') { throw "debug DLL dependency is not allowed: $dependency" }
+              $candidate = Join-Path $stage $dependency
+              if (-not (Test-Path -LiteralPath $candidate)) {
+                $candidate = @($vcpkgBin, $stage) | ForEach-Object { Join-Path $_ $dependency } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+              }
+              if (-not $candidate) {
+                foreach ($root in $redistRoots) {
+                  $candidate = Join-Path $root $dependency
+                  if (Test-Path -LiteralPath $candidate) { break }
+                }
+              }
+              if (-not $candidate -or -not (Test-Path -LiteralPath $candidate)) { throw "unresolved Windows DLL dependency: $dependency" }
+              $destination = Join-Path $stage $dependency
+              if (-not (Test-Path -LiteralPath $destination)) { Copy-Item -LiteralPath $candidate -Destination $destination }
+              $pending += $destination
+            }
+          }
+
+          $entries = @(Get-ChildItem -LiteralPath $stage -File | ForEach-Object Name)
+          foreach ($entry in $entries) {
+            if (($entry -notin @('zerobeat-cli.exe', 'zerobeatd.exe', 'README.md', 'LICENSE')) -and ($entry -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\.dll$')) { throw "unexpected package entry: $entry" }
+            if ($entry -match '(?i)(-d|_d|debug)\.dll$') { throw "debug DLL in package: $entry" }
+          }
+          foreach ($required in @('zerobeat-cli.exe', 'zerobeatd.exe', 'README.md', 'LICENSE')) { if ($entries -notcontains $required) { throw "missing package entry: $required" } }
+          $archive = Join-Path $dist 'zerobeat-windows-x86_64.zip'
+          Push-Location $stage
+          try { Compress-Archive -Path * -DestinationPath $archive -CompressionLevel Optimal } finally { Pop-Location }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            foreach ($entry in $zip.Entries) {
+              if ([string]::IsNullOrEmpty($entry.Name) -or $entry.FullName.Contains('/')) { throw "archive contains a non-root entry: $($entry.FullName)" }
+            }
+          } finally { $zip.Dispose() }
+          $checksum = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$archive.sha256" -Value ("{0}  {1}" -f $checksum, (Split-Path -Leaf $archive)) -NoNewline
+
+          $smoke = Join-Path $env:RUNNER_TEMP 'zerobeat-windows-installer-smoke'
+          Remove-Item -LiteralPath $smoke -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $smoke -Force | Out-Null
+          $smokePrefix = Join-Path $smoke 'prefix'
+          New-Item -ItemType Directory -Path $smokePrefix -Force | Out-Null
+          $sentinel = Join-Path $smokePrefix 'user-data.keep'
+          Set-Content -LiteralPath $sentinel -Value 'preserve me' -NoNewline
+          $baseUri = ([Uri]::new($dist)).AbsoluteUri.TrimEnd('/')
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Version $env:RELEASE_TAG -Prefix $smokePrefix -ReleaseBaseUrl $baseUri -AllowLocalTest -NoPath
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer smoke install failed' }
+          foreach ($name in @('zerobeat-cli.exe', 'zerobeatd.exe')) { if (-not (Test-Path (Join-Path $smokePrefix $name))) { throw "smoke install missing $name" } }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Prefix $smokePrefix -Uninstall -NoPath
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer smoke uninstall failed' }
+          if (-not (Test-Path -LiteralPath $sentinel)) { throw 'Windows installer smoke removed user data' }
+          foreach ($name in @('zerobeat-cli.exe', 'zerobeatd.exe', 'install-manifest.json')) { if (Test-Path (Join-Path $smokePrefix $name)) { throw "smoke uninstall left $name" } }
+
+      - name: Attest Windows release archive
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist-windows/zerobeat-windows-x86_64.zip
+
+      - name: Upload Windows release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release upload "$env:RELEASE_TAG" dist-windows/zerobeat-windows-x86_64.zip dist-windows/zerobeat-windows-x86_64.zip.sha256 --clobber
+
+  release-arm64:
+    needs: [release, release-windows]
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Check out tagged source

@@ -1,10 +1,17 @@
-use std::{ffi::OsStr, os::unix::fs::PermissionsExt};
+use std::ffi::OsStr;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
 use tempfile::tempdir;
-use zerobeat_runtime::{
-    data_dir, prepare_data_dir, prepare_runtime_dir, runtime_dir, socket_path_in,
-};
+#[cfg(unix)]
+use zerobeat_runtime::runtime_dir;
+use zerobeat_runtime::{data_dir, socket_path_in};
+#[cfg(unix)]
+use zerobeat_runtime::{prepare_data_dir, prepare_runtime_dir};
 
+#[cfg(unix)]
 #[test]
 fn xdg_runtime_directory_is_namespaced() {
     assert_eq!(
@@ -13,6 +20,7 @@ fn xdg_runtime_directory_is_namespaced() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn fallback_directory_is_unique_to_the_user() {
     assert_eq!(
@@ -21,6 +29,7 @@ fn fallback_directory_is_unique_to_the_user() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn daemon_socket_is_namespaced_by_protocol_version() {
     let runtime = std::path::Path::new("/run/user/1000/zerobeat");
@@ -36,6 +45,7 @@ fn daemon_socket_is_namespaced_by_protocol_version() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn runtime_directory_is_private() {
     let parent = tempdir().unwrap();
@@ -47,6 +57,7 @@ fn runtime_directory_is_private() {
     assert_eq!(mode, 0o700);
 }
 
+#[cfg(unix)]
 #[test]
 fn data_directory_follows_xdg_and_home_fallback() {
     assert_eq!(
@@ -59,6 +70,7 @@ fn data_directory_follows_xdg_and_home_fallback() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn nested_data_directory_is_created_privately() {
     let parent = tempdir().unwrap();
@@ -68,4 +80,23 @@ fn nested_data_directory_is_created_privately() {
 
     let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_data_directory_uses_local_app_data() {
+    assert_eq!(
+        data_dir(Some(OsStr::new(r"C:\Users\me\AppData\Local")), None).unwrap(),
+        std::path::PathBuf::from(r"C:\Users\me\AppData\Local\ZeroBeat")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_socket_path_is_a_named_pipe_endpoint() {
+    let endpoint = socket_path_in(std::path::Path::new(r"C:\unused"), 11);
+    assert_eq!(
+        endpoint,
+        std::path::PathBuf::from(r"\\.\pipe\ZeroBeat-daemon-v11")
+    );
 }

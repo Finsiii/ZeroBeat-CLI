@@ -1,5 +1,4 @@
 use std::{
-    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
@@ -8,11 +7,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::{
-    net::{UnixListener, UnixStream},
-    sync::{Mutex, watch},
-};
-#[cfg(target_os = "linux")]
+use tokio::sync::{Mutex, watch};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use zerobeat_audio::CancellationController;
 use zerobeat_audio::{AudioBackend, BackendError, BackendTelemetry, StreamSource};
 use zerobeat_catalog::{
@@ -20,18 +16,19 @@ use zerobeat_catalog::{
     QueueRepeatMode, QueueSession, QueueStart, ResolvedStream, SearchRequest,
 };
 use zerobeat_core::Track;
-use zerobeat_ipc::IpcConnection;
+use zerobeat_ipc::{IpcConnection, IpcListener};
 use zerobeat_protocol::{
     AppSnapshot, ClientCommand, DaemonEvent, DownloadSnapshot, DownloadStatus, LibrarySnapshot,
     LyricsLineSnapshot, LyricsStatus, PROTOCOL_VERSION, PlaybackStatus, RepeatMode, SearchStatus,
     SettingsSnapshot,
 };
+use zerobeat_runtime::prepare_data_dir;
 use zerobeat_storage::{Database, DownloadState};
 
 use crate::{DaemonError, download::spawn_download, stream_cache::StreamCache};
 
 pub struct DaemonServer {
-    listener: UnixListener,
+    listener: IpcListener,
     socket_path: PathBuf,
     playback: PlaybackCoordinator,
     catalog: Arc<dyn MusicCatalog>,
@@ -59,7 +56,7 @@ struct PlaybackCoordinator {
     auto_advance_marker: Arc<StdMutex<Option<AutoAdvanceMarker>>>,
     queue_mutation: Arc<Mutex<()>>,
     stream_cache: Arc<StreamCache>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     cancellation: Option<CancellationController>,
 }
 
@@ -172,10 +169,9 @@ impl DaemonServer {
     ) -> Result<Self, DaemonError> {
         let socket_path = path.as_ref().to_path_buf();
         remove_stale_socket(&socket_path).await?;
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = IpcListener::bind(&socket_path)?;
         let download_directory = download_directory.into();
-        std::fs::create_dir_all(&download_directory)?;
-        std::fs::set_permissions(&download_directory, std::fs::Permissions::from_mode(0o700))?;
+        prepare_data_dir(&download_directory)?;
         let library = library_snapshot(&storage)?;
         let settings = SettingsSnapshot {
             crossfade_seconds: storage.crossfade_seconds()?,
@@ -186,7 +182,7 @@ impl DaemonServer {
             ..AppSnapshot::default()
         };
         let audio_backend: Box<dyn AudioBackend> = Box::new(audio);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let cancellation = audio_backend.cancellation_controller();
 
         Ok(Self {
@@ -206,7 +202,7 @@ impl DaemonServer {
                 auto_advance_marker: Arc::new(StdMutex::new(None)),
                 queue_mutation: Arc::new(Mutex::new(())),
                 stream_cache: Arc::new(StreamCache::new()),
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 cancellation,
             },
             catalog: Arc::new(catalog),
@@ -217,7 +213,7 @@ impl DaemonServer {
         })
     }
 
-    pub async fn run(self) -> Result<(), DaemonError> {
+    pub async fn run(mut self) -> Result<(), DaemonError> {
         if let Ok(Some(session)) = self.queue.active_queue().await
             && accept_queue_session(&self.playback, &session)
         {
@@ -230,7 +226,7 @@ impl DaemonServer {
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
-                    let (stream, _) = accepted?;
+                    let connection = accepted?;
                     let playback = self.playback.clone();
                     let catalog = Arc::clone(&self.catalog);
                     let queue = Arc::clone(&self.queue);
@@ -240,7 +236,7 @@ impl DaemonServer {
                     let shutdown_tx = shutdown_tx.clone();
                     tokio::spawn(async move {
                         let _ = handle_client(
-                            stream,
+                            connection,
                             playback,
                             catalog,
                             queue,
@@ -272,6 +268,7 @@ impl DaemonServer {
             let _ = audio.stop();
         }
 
+        #[cfg(unix)]
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
         }
@@ -281,7 +278,7 @@ impl DaemonServer {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
-    stream: UnixStream,
+    mut connection: IpcConnection,
     playback: PlaybackCoordinator,
     catalog: Arc<dyn MusicCatalog>,
     queue: Arc<dyn MusicQueue>,
@@ -290,8 +287,6 @@ async fn handle_client(
     download_directory: Arc<PathBuf>,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
-    let mut connection = IpcConnection::from_stream(stream);
-
     loop {
         let command: ClientCommand = match connection.receive().await {
             Ok(command) => command,
@@ -1267,7 +1262,7 @@ fn queue_session_info(playback: &PlaybackCoordinator) -> Option<(String, i64)> {
 }
 
 fn cancel_incoming(playback: &PlaybackCoordinator) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     if let Some(handle) = &playback.cancellation {
         handle();
     }
@@ -2089,7 +2084,11 @@ impl MusicCatalog for UnavailableCatalog {
     }
 }
 
+#[cfg(unix)]
 async fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
+    use std::os::unix::fs::FileTypeExt;
+    use tokio::net::UnixStream;
+
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2112,6 +2111,25 @@ async fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
 
     std::fs::remove_file(path)?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
+    match IpcConnection::connect(path).await {
+        Ok(_) => Err(DaemonError::AlreadyRunning(path.to_path_buf())),
+        Err(zerobeat_ipc::IpcError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
+        Err(zerobeat_ipc::IpcError::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(DaemonError::AlreadyRunning(path.to_path_buf()))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
@@ -2215,7 +2233,7 @@ mod tests {
             auto_advance_marker: Arc::new(StdMutex::new(None)),
             queue_mutation: Arc::new(Mutex::new(())),
             stream_cache: Arc::new(StreamCache::new()),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             cancellation: None,
         };
         let audio: SharedAudio = Arc::new(StdMutex::new(Box::new(TelemetryBackend {
@@ -2423,7 +2441,7 @@ mod tests {
             auto_advance_marker: Arc::new(StdMutex::new(None)),
             queue_mutation: Arc::new(Mutex::new(())),
             stream_cache: Arc::new(StreamCache::new()),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             cancellation: None,
         };
         let mut snapshot = AppSnapshot::default();
@@ -2451,7 +2469,7 @@ mod tests {
             auto_advance_marker: Arc::new(StdMutex::new(None)),
             queue_mutation: Arc::new(Mutex::new(())),
             stream_cache: Arc::new(StreamCache::new()),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             cancellation: None,
         };
         assert!(!accept_queue_session(&playback, &session(4, false)));
@@ -2501,7 +2519,7 @@ mod tests {
             auto_advance_marker: Arc::new(StdMutex::new(None)),
             queue_mutation: Arc::new(Mutex::new(())),
             stream_cache: Arc::new(StreamCache::new()),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             cancellation: None,
         };
         let storage = Arc::new(StdMutex::new(Database::open_in_memory().unwrap()));

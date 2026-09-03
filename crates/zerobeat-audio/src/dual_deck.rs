@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::CancellationController;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::NativeCancellationHandle;
 use crate::{AudioBackend, BackendError, BackendTelemetry, CrossfadeCurve, StreamSource};
 
@@ -19,11 +19,11 @@ use std::sync::{Condvar, OnceLock};
 pub struct DualDeck<B> {
     inner: Arc<Mutex<DeckState<B>>>,
     generation: Arc<AtomicU64>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     active_slot: Arc<AtomicUsize>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     incoming_slot: Arc<AtomicUsize>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     cancellation_handles: [Option<NativeCancellationHandle>; 2],
 }
 
@@ -64,7 +64,7 @@ fn pause_after_generation_check() {
 
 impl<B: AudioBackend> DualDeck<B> {
     pub fn new(first: B, second: B) -> Self {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let cancellation_handles = [first.cancellation_handle(), second.cancellation_handle()];
         Self {
             inner: Arc::new(Mutex::new(DeckState {
@@ -75,16 +75,16 @@ impl<B: AudioBackend> DualDeck<B> {
                 volume: 1.0,
             })),
             generation: Arc::new(AtomicU64::new(0)),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             active_slot: Arc::new(AtomicUsize::new(0)),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             incoming_slot: Arc::new(AtomicUsize::new(usize::MAX)),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             cancellation_handles,
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn incoming_cancellation_handle(&self) -> Option<NativeCancellationHandle> {
         let slot = self.incoming_slot.load(Ordering::Acquire);
         (slot < self.cancellation_handles.len())
@@ -97,13 +97,13 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
     fn load(&mut self, source: &StreamSource) -> Result<(), BackendError> {
         let mut state = lock_decks(&self.inner)?;
         self.generation.fetch_add(1, Ordering::AcqRel);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         self.incoming_slot.store(usize::MAX, Ordering::Release);
         stop_both(&mut state.decks)?;
         state.incoming = None;
         state.progress = 0.0;
         let active = state.active;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         self.active_slot.store(active, Ordering::Release);
         let volume = state.volume;
         state.decks[active].load(source)?;
@@ -119,7 +119,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
     fn pause(&mut self) -> Result<(), BackendError> {
         let mut state = lock_decks(&self.inner)?;
         self.generation.fetch_add(1, Ordering::AcqRel);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         self.incoming_slot.store(usize::MAX, Ordering::Release);
         if let Some(incoming) = state.incoming.take() {
             let outgoing = state.active;
@@ -127,7 +127,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
             state.decks[outgoing].stop()?;
             state.decks[incoming].set_volume(volume)?;
             state.active = incoming;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             self.active_slot.store(incoming, Ordering::Release);
         }
         let active = state.active;
@@ -137,7 +137,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
     fn stop(&mut self) -> Result<(), BackendError> {
         let mut state = lock_decks(&self.inner)?;
         self.generation.fetch_add(1, Ordering::AcqRel);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         self.incoming_slot.store(usize::MAX, Ordering::Release);
         state.incoming = None;
         state.progress = 0.0;
@@ -173,30 +173,30 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
             if !should_continue() {
                 return Ok(());
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             self.incoming_slot.store(incoming, Ordering::Release);
             if let Err(error) = state.decks[incoming].load(source) {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 self.incoming_slot.store(usize::MAX, Ordering::Release);
                 return Err(error);
             }
             if !should_continue() {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 self.incoming_slot.store(usize::MAX, Ordering::Release);
                 return state.decks[incoming].stop();
             }
             if let Err(error) = state.decks[incoming].set_volume(0.0) {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 self.incoming_slot.store(usize::MAX, Ordering::Release);
                 return Err(error);
             }
             if let Err(error) = state.decks[incoming].play() {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 self.incoming_slot.store(usize::MAX, Ordering::Release);
                 return Err(error);
             }
             if !should_continue() {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 self.incoming_slot.store(usize::MAX, Ordering::Release);
                 return state.decks[incoming].stop();
             }
@@ -206,9 +206,9 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
 
         let inner = Arc::clone(&self.inner);
         let active_generation = Arc::clone(&self.generation);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let incoming_slot = Arc::clone(&self.incoming_slot);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let active_slot = Arc::clone(&self.active_slot);
         thread::spawn(move || {
             let millis = duration.as_millis().max(1);
@@ -229,7 +229,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
                     return;
                 }
                 let Some(incoming) = state.incoming else {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     incoming_slot.store(usize::MAX, Ordering::Release);
                     return;
                 };
@@ -246,7 +246,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
                     let _ = outgoing_deck.set_volume(volume);
                     state.incoming = None;
                     state.progress = 0.0;
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
                     incoming_slot.store(usize::MAX, Ordering::Release);
                     return;
                 }
@@ -263,7 +263,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
                 let _ = state.decks[incoming].set_volume(volume);
                 state.active = incoming;
                 state.progress = 0.0;
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 {
                     active_slot.store(incoming, Ordering::Release);
                     incoming_slot.store(usize::MAX, Ordering::Release);
@@ -319,7 +319,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
         state.decks[target].last_error()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn cancellation_handle(&self) -> Option<NativeCancellationHandle> {
         self.incoming_cancellation_handle().or_else(|| {
             let slot = self.active_slot.load(Ordering::Acquire);
@@ -329,7 +329,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn cancel_current_load(&self) {
         if let Some(handle) = self.incoming_cancellation_handle() {
             handle.cancel();
@@ -341,6 +341,7 @@ impl<B: AudioBackend + 'static> AudioBackend for DualDeck<B> {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn cancellation_controller(&self) -> Option<CancellationController> {
         let incoming_slot = Arc::clone(&self.incoming_slot);
         let active_slot = Arc::clone(&self.active_slot);
@@ -387,6 +388,7 @@ fn deck_pair<B>(decks: &mut [B; 2], outgoing: usize, incoming: usize) -> (&mut B
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use crate::NativeEngine;
 
     struct RecordingBackend {
@@ -536,6 +538,7 @@ mod tests {
         assert!(!events.iter().any(|event| event == "b:replacement:play"));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn incoming_cancellation_handle_tracks_dynamic_deck_slot() {
         let first = NativeEngine::new().unwrap();

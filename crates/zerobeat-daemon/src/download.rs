@@ -1,7 +1,6 @@
 use std::{
     fs::OpenOptions,
     io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -94,11 +93,14 @@ async fn download_stream(stream: &ResolvedStream, destination: &Path) -> Result<
     const CHUNK_SIZE: u64 = 60 * 1024;
     let temporary = destination.with_extension("part");
     let result = async {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temporary)
             .map_err(|error| error.to_string())?;
         let client = reqwest::Client::builder()

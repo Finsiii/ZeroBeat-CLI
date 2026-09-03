@@ -1,9 +1,10 @@
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
-};
+use std::{fs::OpenOptions, io::Write, path::Path};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 
 use p256::ecdsa::SigningKey;
 use rand_core::{OsRng, RngCore};
@@ -41,12 +42,11 @@ impl IdentityStore {
     pub fn load(path: impl AsRef<Path>) -> Result<DeviceIdentity, SecurityError> {
         let path = path.as_ref();
         let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != rustix::process::getuid().as_raw()
-        {
+        if !is_safe_identity_file(&metadata) || !owned_by_current_user(&metadata) {
             return Err(SecurityError::UnsafeIdentity);
         }
+
+        #[cfg(unix)]
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let stored: StoredIdentity = rmp_serde::from_slice(&std::fs::read(path)?)?;
         if stored.format_version != 1 || stored.private_key.len() != 32 {
@@ -79,15 +79,74 @@ impl IdentityStore {
         let mut suffix = [0_u8; 8];
         OsRng.fill_bytes(&mut suffix);
         let temporary = path.with_extension(format!("tmp-{}", hex::encode(suffix)));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(&payload)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
+        drop(file);
+        atomic_replace(&temporary, path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !is_safe_identity_file(&metadata) || !owned_by_current_user(&metadata) {
+            return Err(SecurityError::UnsafeIdentity);
+        }
+        #[cfg(unix)]
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn is_safe_identity_file(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(unix)]
+fn is_safe_identity_file(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn owned_by_current_user(metadata: &std::fs::Metadata) -> bool {
+    metadata.uid() == rustix::process::getuid().as_raw()
+}
+
+#[cfg(windows)]
+fn owned_by_current_user(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn atomic_replace(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let flags = windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+        | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+    let result = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            flags,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
         Ok(())
     }
 }

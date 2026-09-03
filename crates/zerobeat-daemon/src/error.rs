@@ -8,6 +8,8 @@ pub enum DaemonError {
     Io(#[from] std::io::Error),
     #[error("daemon IPC failed: {0}")]
     Ipc(#[from] zerobeat_ipc::IpcError),
+    #[error("daemon runtime preparation failed: {0}")]
+    Runtime(#[from] zerobeat_runtime::RuntimeError),
     #[error("guest database failed: {0}")]
     Storage(#[from] zerobeat_storage::StorageError),
     #[error("socket path is occupied by a non-socket file: {0}")]
